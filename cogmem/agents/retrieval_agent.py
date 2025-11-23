@@ -17,7 +17,7 @@ from ..prompt import (
     EVIDENCE_ASSESSMENT_SYSTEM, EVIDENCE_ASSESSMENT_USER
 )
 from ..utils.json_utils import safe_json_loads
-from ..storage.schema import RetrievalResult, Entity
+from ..storage.schema import RetrievalResult, Entity, NodeTypeEnum
 from typing import List, Dict, Any
 import json
 
@@ -80,9 +80,9 @@ class RetrievalAgent:
         complexity_level = query_analysis.get("complexity_level", "simple")
         
         # ============================================
-        # [ACT] STEP 2: Initial 1-hop Retrieval
+        # [ACT] STEP 2: Initial Retrieval using Retriever
         # ============================================
-        print(f"[RetrievalAgent] [ACT] Performing initial 1-hop retrieval for entities: {required_entities}")
+        print(f"[RetrievalAgent] [ACT] Performing initial retrieval for entities: {required_entities}")
         
         # Lookup main entities in graph
         found_entities = []
@@ -90,36 +90,41 @@ class RetrievalAgent:
             found_entities = self._lookup_entities_in_graph(required_entities)
             print(f"[RetrievalAgent] [ACT] Found {len(found_entities)} entities in graph: {[e.name for e in found_entities[:3]]}")
         
-        # Perform initial 1-hop retrieval
+        # Use the main Retriever to perform retrieval (it handles all the graph traversal internally)
+        # This is more reliable than trying to manually traverse the graph
         initial_evidence = []
         all_entities = list(found_entities)
         
         if found_entities:
-            # Use 1-hop traversal (max_depth=1 for initial retrieval)
-            for entity in found_entities:
-                person = self.cogmem.graph.get_person(entity.id)
-                if person:
-                    if hasattr(self.cogmem.retriever, '_traverse_person_structured_nodes'):
-                        person_evidence = self.cogmem.retriever._traverse_person_structured_nodes(
-                            entity,
-                            max_depth=1,  # 1-hop only for initial retrieval
-                            max_nodes=10,  # Limit initial evidence
-                            query=query
-                        )
-                        initial_evidence.extend(person_evidence)
-                        print(f"[RetrievalAgent] [ACT] Retrieved {len(person_evidence)} evidence items for {entity.name} (1-hop)")
-                else:
-                    # For non-Person entities, get directly connected nodes
-                    graph = self.cogmem.graph._g
+            # Use the retriever's retrieve method which handles Topic-Scoped retrieval
+            try:
+                retrieval_result = self.cogmem.retriever.retrieve(query, top_k=top_k)
+                initial_evidence = retrieval_result.evidence if retrieval_result.evidence else []
+                all_entities = retrieval_result.entities if retrieval_result.entities else found_entities
+                # 保存检索路径以便后续使用
+                if hasattr(retrieval_result, 'retrieval_path') and retrieval_result.retrieval_path:
+                    # 将在最终结果中合并检索路径
+                    pass
+                print(f"[RetrievalAgent] [ACT] Retrieved {len(initial_evidence)} evidence items using Retriever")
+            except Exception as e:
+                print(f"[RetrievalAgent] [ERROR] Retriever failed: {e}, falling back to simple graph traversal")
+                # Fallback: simple graph traversal
+                graph = self.cogmem.graph._g
+                for entity in found_entities:
                     if entity.id in graph:
+                        # Get connected nodes (1-hop)
                         for _, target_id, key, edge_data in graph.out_edges(entity.id, keys=True, data=True):
                             fact = self.cogmem.graph.get_fact(target_id)
                             if fact:
-                                initial_evidence.append(self.cogmem.retriever._format_fact_evidence(fact))
+                                fact_text = f"Fact: {fact.subject} {fact.predicate} {fact.object}"
+                                initial_evidence.append(fact_text)
                             else:
                                 event = self.cogmem.graph.get_event(target_id)
                                 if event:
-                                    initial_evidence.append(self.cogmem.retriever._format_event_evidence(event))
+                                    event_text = f"Event: {event.title} (Participants: {', '.join(event.participants)})"
+                                    if event.time_start:
+                                        event_text += f" [Time: {event.time_start}]"
+                                    initial_evidence.append(event_text)
         
         print(f"[RetrievalAgent] [ACT] Initial retrieval complete: {len(initial_evidence)} evidence items")
         
@@ -185,10 +190,18 @@ class RetrievalAgent:
         # Limit evidence to top_k
         final_evidence = all_evidence[:top_k * 2]  # Allow more evidence than entities
         
+        # 构建检索路径
+        retrieval_path = ["retrieval-agent"]
+        if initial_evidence:
+            retrieval_path.append("initial-retrieval")
+        if len(all_evidence) > len(initial_evidence):
+            retrieval_path.append("expansion")
+        
         result = RetrievalResult(
             query=query,
             entities=final_entities,
-            evidence=final_evidence
+            evidence=final_evidence,
+            retrieval_path=retrieval_path
         )
         result.extracted_entity_names = required_entities
         
@@ -258,7 +271,9 @@ class RetrievalAgent:
                     continue
                 
                 # Check Person nodes by canonical_name
-                if node_data.get("node_type") == "Person":
+                # Use NodeTypeEnum.PERSON.value ("person") instead of "Person"
+                node_type = node_data.get("node_type")
+                if node_type == "person" or node_type == NodeTypeEnum.PERSON.value:
                     canonical_name = node_data.get("canonical_name", "")
                     if canonical_name and canonical_name.lower() == entity_name_lower:
                         return True

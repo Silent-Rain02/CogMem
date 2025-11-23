@@ -173,7 +173,7 @@ class Retriever:
 
         if not seed_nodes:
             print(f"[Retriever] [Scope] [Phase 2] No seeds found, falling back to entity-based retrieval")
-            return self._fallback_retrieve(query, top_k)
+            return self._fallback_entity_retrieve(query, top_k)
 
         print(f"[Retriever] [Scope] [Phase 2] Found {len(seed_nodes)} seed nodes:")
         for node_id, node_type, similarity in seed_nodes[:5]:
@@ -374,7 +374,7 @@ class Retriever:
         node_type: str,
         top_k: int = 10
     ) -> List[Tuple[str, str, float]]:
-        """按节点类型搜索节点（使用向量存储快速检索）
+        """按节点类型搜索节点（使用向量存储快速检索，fallback到图遍历）
 
         Args:
             query_vec: 查询向量
@@ -422,6 +422,48 @@ class Retriever:
                 results.append((node_id, node_type, similarity))
 
         print(f"[Retriever] [Search] Type matched: {type_matched}, After threshold: {len(results)}")
+        
+        # 如果VectorStore返回0个候选，使用图遍历作为fallback
+        if len(results) == 0 and len(candidates) == 0:
+            print(f"[Retriever] [Search] VectorStore empty, falling back to graph traversal for {node_type} nodes")
+            results = self._fallback_graph_search(node_type, top_k)
+        
+        return results
+    
+    def _fallback_graph_search(
+        self,
+        node_type: str,
+        top_k: int = 10
+    ) -> List[Tuple[str, str, float]]:
+        """当VectorStore为空时，直接从图中搜索节点（fallback方法）
+        
+        Args:
+            node_type: 节点类型（event, fact 等）
+            top_k: 返回数量
+            
+        Returns:
+            List of (node_id, node_type, similarity)
+        """
+        results = []
+        graph = self._graph._g
+        
+        # 遍历所有节点，找到匹配类型的节点
+        for node_id, node_data in graph.nodes(data=True):
+            if len(results) >= top_k:
+                break
+                
+            if not node_data:
+                continue
+                
+            # 检查节点类型是否匹配
+            if node_data.get("node_type") != node_type:
+                continue
+            
+            # 使用默认相似度（因为没有向量搜索）
+            similarity = 0.5  # 默认相似度
+            results.append((node_id, node_type, similarity))
+        
+        print(f"[Retriever] [Fallback] Found {len(results)} {node_type} nodes from graph")
         return results
 
     def _get_node_text_for_search(self, node_data: Dict[str, Any], node_type: str) -> str:
@@ -956,6 +998,94 @@ class Retriever:
                 entities.append(self._entity_cache[entity_name])
 
         return entities
+    
+    def _fallback_entity_retrieve(self, query: str, top_k: int = 10) -> RetrievalResult:
+        """当VectorStore为空时的fallback检索：直接从图中遍历Person节点的邻居
+        
+        Args:
+            query: 查询字符串
+            top_k: 返回数量
+            
+        Returns:
+            RetrievalResult对象
+        """
+        from ..storage.schema import RetrievalResult
+        
+        result = RetrievalResult(query=query)
+        result.retrieval_path.append("fallback-entity-traversal")
+        
+        # 从查询中提取实体名称
+        query_lower = query.lower()
+        person_ids = []
+        
+        # 查找Person节点
+        for node_id, node_data in self._graph._g.nodes(data=True):
+            if not node_data:
+                continue
+            if node_data.get("node_type") == NodeTypeEnum.PERSON.value:
+                canonical_name = node_data.get("canonical_name", "")
+                if canonical_name and canonical_name.lower() in query_lower:
+                    person_ids.append(node_id)
+                    # 创建Entity对象用于返回
+                    try:
+                        person = self._graph.get_person(node_id)
+                        if person:
+                            entity = Entity(
+                                id=person.id,
+                                name=person.canonical_name,
+                                type="world",
+                                subtype="person"
+                            )
+                            result.entities.append(entity)
+                    except:
+                        pass
+        
+        # 从Person节点遍历，收集Event和Fact节点
+        traversed_nodes = []
+        graph = self._graph._g
+        
+        for person_id in person_ids[:3]:  # 限制最多3个Person
+            if person_id not in graph:
+                continue
+            
+            # 1-hop: 直接连接的Event和Fact
+            for _, target_id in graph.out_edges(person_id):
+                if target_id in [n[0] for n in traversed_nodes]:
+                    continue
+                
+                target_data = graph.nodes.get(target_id, {})
+                target_type = target_data.get("node_type")
+                
+                if target_type in [NodeTypeEnum.EVENT.value, NodeTypeEnum.FACT.value]:
+                    traversed_nodes.append((target_id, target_type, 0.5, 1))  # (id, type, sim, depth)
+            
+            # 2-hop: 通过Event连接的Fact
+            for _, event_id in graph.out_edges(person_id):
+                event_data = graph.nodes.get(event_id, {})
+                if event_data.get("node_type") != NodeTypeEnum.EVENT.value:
+                    continue
+                
+                for _, fact_id in graph.out_edges(event_id):
+                    if fact_id in [n[0] for n in traversed_nodes]:
+                        continue
+                    
+                    fact_data = graph.nodes.get(fact_id, {})
+                    if fact_data.get("node_type") == NodeTypeEnum.FACT.value:
+                        traversed_nodes.append((fact_id, NodeTypeEnum.FACT.value, 0.4, 2))
+        
+        # 限制数量
+        traversed_nodes = traversed_nodes[:top_k * 2]
+        
+        # 格式化证据
+        if traversed_nodes:
+            evidence = self._format_evidence_with_scope(
+                nodes=traversed_nodes[:top_k],
+                matched_topics=[]
+            )
+            result.evidence = evidence
+        
+        print(f"[Retriever] [Fallback] Retrieved {len(result.evidence)} evidence items from graph traversal")
+        return result
 
     def _build_entity_cache(self) -> Dict[str, str]:
         """构建实体缓存

@@ -193,12 +193,18 @@ def compute_evidence_hit(evidence: List[str], gold_answer: str) -> float:
             continue
 
         # 新格式：过滤掉 [Depth: ...] [Time: ...] [Topic: ...] [Type: ...] [Conf: ...] 等元数据标记
-        # 提取实际内容（最后一个 ] 之后的部分）
-        content_start = ev.rfind(']')
-        if content_start != -1 and content_start < len(ev) - 1:
-            ev_content = ev[content_start + 1:].strip()
-        else:
-            ev_content = ev
+        # 提取实际内容：移除所有 [XXX: ...] 格式的标记
+        import re
+        # 移除所有 [XXX: ...] 格式的标记
+        ev_content = re.sub(r'\[[^\]]+\]', '', ev).strip()
+        
+        # 如果移除标记后内容为空，尝试提取最后一个 ] 之后的内容
+        if not ev_content:
+            content_start = ev.rfind(']')
+            if content_start != -1 and content_start < len(ev) - 1:
+                ev_content = ev[content_start + 1:].strip()
+            else:
+                ev_content = ev
 
         if not ev_content:
             continue
@@ -209,9 +215,13 @@ def compute_evidence_hit(evidence: List[str], gold_answer: str) -> float:
         # 计算匹配的关键词数量
         matched_words = len(gold_tokens & ev_tokens)
 
-        # 如果至少50%的关键词匹配，认为命中
-        if matched_words >= len(gold_tokens) * 0.5:
-            return 1.0
+        # 对于短答案（关键词<=2），需要100%匹配；对于长答案，至少50%匹配
+        if len(gold_tokens) <= 2:
+            if matched_words == len(gold_tokens):
+                return 1.0
+        else:
+            if matched_words >= len(gold_tokens) * 0.5:
+                return 1.0
 
     return 0.0
 
@@ -367,7 +377,7 @@ def comprehensive_evaluation(
                 "retrieved_entities": [
                     {
                         "name": e.name,
-                        "description": e.description[:100] + "..." if len(e.description) > 100 else e.description,
+                        "description": getattr(e, 'description', '')[:100] + "..." if len(getattr(e, 'description', '')) > 100 else getattr(e, 'description', ''),
                         "type": e.type
                     }
                     for e in retrieval_result.entities[:10]  # 增加到10个实体

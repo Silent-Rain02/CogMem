@@ -173,6 +173,7 @@ class Indexer:
                             try:
                                 # 在保存前，先将已处理的节点临时添加到图中（用于checkpoint）
                                 # 注意：这里只处理已收集的节点，不处理episodes（episodes在最后统一处理）
+                                checkpoint_nodes_to_embed = []
                                 if all_nodes:
                                     # 临时去重并添加节点（不处理episodes）
                                     temp_unique_nodes_dict = {}
@@ -184,6 +185,8 @@ class Indexer:
                                     nodes_to_add = [node for node in temp_unique_nodes if node.id not in self._graph._g]
                                     if nodes_to_add:
                                         self._graph.add_nodes(nodes_to_add)
+                                        # 记录需要向量化的新节点
+                                        checkpoint_nodes_to_embed = nodes_to_add
                                     
                                     # 临时添加关系（只添加已存在的节点之间的关系）
                                     if all_relations:
@@ -206,8 +209,17 @@ class Indexer:
                                                 if not self._graph._g.has_edge(r.head_id, r.tail_id, key=r.rel_type):
                                                     self._graph.add_relations([r])
                                 
+                                # 在保存前，先向量化新添加的节点
+                                if checkpoint_nodes_to_embed:
+                                    try:
+                                        print(f"[Checkpoint] 正在向量化 {len(checkpoint_nodes_to_embed)} 个新节点...")
+                                        self._batch_embed_nodes(checkpoint_nodes_to_embed)
+                                        print(f"[Checkpoint] ✓ 节点向量化完成")
+                                    except Exception as embed_err:
+                                        print(f"[Checkpoint] ⚠️  节点向量化失败: {str(embed_err)}，将继续保存（节点已添加到图）")
+                                
                                 self._cogmem.save()
-                                print(f"[Checkpoint] ✓ 索引保存成功（已处理 {processed_docs_count} 个文档，图中有 {self._graph.num_entities()} 个节点）")
+                                print(f"[Checkpoint] ✓ 索引保存成功（已处理 {processed_docs_count} 个文档，图中有 {self._graph.num_entities()} 个节点，向量索引中有 {self._vstore.size()} 个向量）")
                             except Exception as save_err:
                                 print(f"[Checkpoint] ✗ 索引保存失败: {str(save_err)}")
 
@@ -381,7 +393,43 @@ class Indexer:
         # 7. 最终保存（确保所有数据都已持久化）
         if self._cogmem:
             try:
-                print(f"  正在执行最终保存（图中有 {self._graph.num_entities()} 个节点）...")
+                # 在最终保存前，确保所有节点都已向量化
+                # 检查是否有未向量化的节点（只检查主要节点类型）
+                from ..storage.schema import NodeTypeEnum
+                nodes_to_embed = []
+                for node_id in self._graph._g.nodes():
+                    if node_id not in self._vstore._ids:
+                        node_data = self._graph._g.nodes[node_id]
+                        node_type = node_data.get("node_type")
+                        if node_type in [NodeTypeEnum.EVENT.value, NodeTypeEnum.FACT.value, 
+                                        NodeTypeEnum.PERSON.value, NodeTypeEnum.PREFERENCE.value]:
+                            try:
+                                if node_type == NodeTypeEnum.EVENT.value:
+                                    node_obj = self._graph.get_event(node_id)
+                                elif node_type == NodeTypeEnum.FACT.value:
+                                    node_obj = self._graph.get_fact(node_id)
+                                elif node_type == NodeTypeEnum.PERSON.value:
+                                    node_obj = self._graph.get_person(node_id)
+                                elif node_type == NodeTypeEnum.PREFERENCE.value:
+                                    node_obj = self._graph.get_preference(node_id)
+                                else:
+                                    node_obj = None
+                                
+                                if node_obj:
+                                    nodes_to_embed.append(node_obj)
+                            except:
+                                pass
+                
+                # 如果有未向量化的节点，先向量化它们
+                if nodes_to_embed:
+                    print(f"  检测到 {len(nodes_to_embed)} 个未向量化的节点，正在补充向量化...")
+                    try:
+                        self._batch_embed_nodes(nodes_to_embed)
+                        print(f"  ✓ 补充向量化完成")
+                    except Exception as embed_err:
+                        print(f"  ⚠️  补充向量化失败: {str(embed_err)}，将继续保存")
+                
+                print(f"  正在执行最终保存（图中有 {self._graph.num_entities()} 个节点，向量索引中有 {self._vstore.size()} 个向量）...")
                 self._cogmem.save()
                 print(f"  ✓ 最终保存完成")
             except Exception as save_err:
@@ -703,16 +751,50 @@ class Indexer:
         week_to_episode = {}  # (year, week_number) -> Episode
         week_to_participants = defaultdict(set)  # (year, week_number) -> set of person_ids
 
+        # Helper function to parse date string (handles partial dates like YYYY-MM-XX)
+        def parse_event_date(date_str: str) -> Optional[datetime]:
+            """解析事件日期，支持完整日期和部分日期（YYYY-MM-XX）"""
+            if not date_str:
+                return None
+            
+            # Handle partial dates (YYYY-MM-XX)
+            if date_str.endswith('-XX'):
+                parts = date_str.split('-')
+                if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                    try:
+                        year = int(parts[0])
+                        month = int(parts[1])
+                        if 1 <= month <= 12 and 1900 <= year <= 2100:
+                            # Use the first day of the month as a reasonable default
+                            return datetime(year, month, 1)
+                    except (ValueError, TypeError):
+                        pass
+                return None
+            
+            # Handle full ISO format dates
+            try:
+                # Remove timezone info if present and try parsing
+                date_str_clean = date_str.replace('Z', '+00:00')
+                return datetime.fromisoformat(date_str_clean)
+            except (ValueError, TypeError):
+                # Try alternative formats
+                try:
+                    # Try YYYY-MM-DD format
+                    return datetime.strptime(date_str, "%Y-%m-%d")
+                except (ValueError, TypeError):
+                    return None
+
         # Group events by week
         for event in events:
             event_time = None
             if event.time_start:
-                event_time = datetime.fromisoformat(event.time_start.replace('Z', '+00:00'))
+                event_time = parse_event_date(event.time_start)
             elif event.time_end:
-                event_time = datetime.fromisoformat(event.time_end.replace('Z', '+00:00'))
+                event_time = parse_event_date(event.time_end)
 
             if not event_time:
-                continue  # Skip events without time info
+                # Skip events without valid time info
+                continue
 
             # Get ISO week (Monday-based)
             year, week_number, _ = event_time.isocalendar()
