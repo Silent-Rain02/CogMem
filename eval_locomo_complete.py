@@ -289,13 +289,9 @@ def comprehensive_evaluation(
         start_time = time.time()
         
         try:
-            # 对于评测，我们简化流程：直接使用检索+生成，避免复杂的Agentic推理
-            # 获取检索结果
-            retrieval_result = cogmem.retrieve(question, top_k=10)
-
-            # 基于检索结果生成答案（使用简化的生成逻辑）
-            from cogmem.generation.rag import generate_answer
-            predicted_answer = generate_answer(cogmem.cfg, retrieval_result)
+            # 使用 Agent 进行检索和回答（通过 QAOrchestrator）
+            # 调用 answer 方法，同时获取答案和检索结果
+            predicted_answer, retrieval_result = cogmem.answer(question, top_k=10, return_retrieval_result=True)
             
             inference_time = time.time() - start_time
             
@@ -677,10 +673,30 @@ def main():
     print(f" Event 节点数: {event_count}")
     print(f" Fact 节点数: {fact_count}")
 
-    # 如果没有 Topic 节点但图不为空，警告用户
-    if total_nodes > 0 and topic_count == 0:
-        print(" ⚠️ 警告：未找到 Topic 节点。确保在索引时调用了 cogmem.discover_communities(semantic=True)")
-        print("    没有 Topic 节点会导致检索退回到实体基础的 fallback 模式，性能可能下降")
+    # 检查是否需要执行社区发现（如果有节点但没有Topic节点）
+    needs_community_discovery = total_nodes > 0 and topic_count == 0
+    
+    if needs_community_discovery:
+        print(" ⚠️ 检测到图中有节点但没有 Topic 节点，需要执行社区发现...")
+        print("  正在发现语义社区（这可能需要几分钟）...")
+        try:
+            cogmem.discover_communities(semantic=True)
+            print("  ✓ 社区发现完成")
+            
+            # 重新统计 Topic 节点
+            topic_count = 0
+            for node_id, node_data in cogmem.graph._g.nodes(data=True):
+                if node_data and node_data.get("node_type") == NodeTypeEnum.TOPIC.value:
+                    topic_count += 1
+            print(f"  现在有 {topic_count} 个 Topic 节点")
+            
+            # 保存更新后的索引
+            print("  正在保存更新后的索引...")
+            cogmem.save()
+            print("  ✓ 索引保存完成")
+        except Exception as e:
+            print(f"  ✗ 社区发现失败: {e}")
+            print("    继续使用现有索引（可能影响检索性能）")
     
     # 索引数据集（如果需要）
     if total_nodes == 0:

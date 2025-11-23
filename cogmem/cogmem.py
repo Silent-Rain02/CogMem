@@ -357,8 +357,9 @@ class CogMem:
         query: str, 
         top_k: int = 10, 
         use_enhanced_retrieval: bool = True,
-        enable_post_processing: bool = True
-    ) -> str:
+        enable_post_processing: bool = True,
+        return_retrieval_result: bool = False
+    ):
         """生成答案（使用Agentic方式）
         
         Args:
@@ -366,12 +367,14 @@ class CogMem:
             top_k: 返回的实体数量
             use_enhanced_retrieval: 是否使用增强版检索（保留参数以兼容旧代码，但实际使用Agentic）
             enable_post_processing: 是否启用答案后处理（保留参数以兼容旧代码）
+            return_retrieval_result: 是否同时返回检索结果
             
         Returns:
-            生成的答案
+            如果 return_retrieval_result=True，返回 (answer, retrieval_result)
+            否则只返回 answer
         """
         # 使用Agentic问答协调器
-        return self.qa_orchestrator.answer(query, top_k)
+        return self.qa_orchestrator.answer(query, top_k, return_retrieval_result=return_retrieval_result)
 
     def update_entity(self, entity_id: str, patch: Dict) -> None:
         e = self.graph.get_entity(entity_id)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, List, Tuple, Dict, Optional, Any
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -217,12 +217,55 @@ class Indexer:
                         print(f"[!]  获取文档处理结果时出错: {str(e)}")
                         continue
             except KeyboardInterrupt:
-                # Ctrl+C 直接退出，不等待
-                print("\n[!]  收到中断信号，正在退出...")
+                # Ctrl+C 中断时，保存已处理的节点
+                print("\n[!]  收到中断信号，正在保存已处理的节点...")
                 # 取消所有未完成的任务
                 for future in futures:
                     if not future.done():
                         future.cancel()
+                
+                # 保存已处理的节点（即使未完成所有文档）
+                if all_nodes and self._cogmem:
+                    try:
+                        print(f"  正在保存已处理的 {len(all_nodes)} 个节点...")
+                        # 去重节点
+                        temp_unique_nodes_dict = {}
+                        for node in all_nodes:
+                            temp_unique_nodes_dict[node.id] = node
+                        temp_unique_nodes = list(temp_unique_nodes_dict.values())
+                        
+                        # 添加节点到图（如果还没有添加）
+                        nodes_to_add = [node for node in temp_unique_nodes if node.id not in self._graph._g]
+                        if nodes_to_add:
+                            self._graph.add_nodes(nodes_to_add)
+                        
+                        # 添加关系
+                        if all_relations:
+                            temp_node_ids = {n.id for n in temp_unique_nodes}
+                            temp_filtered_relations = [
+                                r for r in all_relations
+                                if r.head_id in temp_node_ids and r.tail_id in temp_node_ids
+                            ]
+                            if temp_filtered_relations:
+                                # 去重关系
+                                temp_unique_relations_dict = {}
+                                for r in temp_filtered_relations:
+                                    key = (r.head_id, r.tail_id, r.rel_type)
+                                    if key not in temp_unique_relations_dict or r.confidence > temp_unique_relations_dict[key].confidence:
+                                        temp_unique_relations_dict[key] = r
+                                temp_unique_relations = list(temp_unique_relations_dict.values())
+                                
+                                # 只添加新关系
+                                for r in temp_unique_relations:
+                                    if not self._graph._g.has_edge(r.head_id, r.tail_id, key=r.rel_type):
+                                        self._graph.add_relations([r])
+                        
+                        # 保存检查点
+                        self._cogmem.save()
+                        print(f"  ✓ 已保存检查点（图中有 {self._graph.num_entities()} 个节点）")
+                    except Exception as save_err:
+                        print(f"  ✗ 保存检查点失败: {str(save_err)}")
+                
                 raise
 
         # 4. 去重和存图（在循环外批量处理）
@@ -266,9 +309,11 @@ class Indexer:
 
             print(f"  ✓ 创建了 {len(episode_nodes)} 个 episode 和 {len(episode_relations)} 个关系")
 
-        # 4.2 存图（nodes）
+        # 4.2 存图（nodes）- 确保所有节点都已添加
         if unique_nodes:
+            print(f"  正在添加 {len(unique_nodes)} 个节点到图...")
             self._graph.add_nodes(unique_nodes)
+            print(f"  ✓ 节点添加完成（图中共有 {self._graph.num_entities()} 个节点）")
 
         # 4.3 去重并合并所有 relations（原始关系 + episode 关系）
         all_relations.extend(episode_relations)
@@ -281,7 +326,7 @@ class Indexer:
                 unique_relations_dict[key] = r
         unique_relations = list(unique_relations_dict.values())
 
-        # 4.4 存图（relations）
+        # 4.4 存图（relations）- 确保所有关系都已添加
         if unique_relations:
             node_ids = {n.id for n in unique_nodes}
             filtered_relations = [
@@ -289,13 +334,26 @@ class Indexer:
                 if r.head_id in node_ids and r.tail_id in node_ids
             ]
             if filtered_relations:
+                print(f"  正在添加 {len(filtered_relations)} 个关系到图...")
                 self._graph.add_relations(filtered_relations)
+                print(f"  ✓ 关系添加完成（图中共有 {self._graph.num_relations()} 个关系）")
 
         # 5. 批量嵌入节点
         try:
-            self._batch_embed_nodes(unique_nodes)
+            if unique_nodes:
+                print(f"  正在生成节点向量（共 {len(unique_nodes)} 个节点）...")
+                self._batch_embed_nodes(unique_nodes)
+                print(f"  ✓ 节点向量化完成")
         except KeyboardInterrupt:
             print("\n[!]  节点嵌入被中断")
+            # 即使嵌入中断，节点已经添加到图中，可以继续
+            if self._cogmem:
+                try:
+                    print("  正在保存已添加的节点（不含向量）...")
+                    self._cogmem.save()
+                    print("  ✓ 节点已保存（向量将在下次索引时补充）")
+                except Exception as save_err:
+                    print(f"  ✗ 保存失败: {str(save_err)}")
             raise
 
         # 6. 批量嵌入 Chunks
@@ -317,7 +375,18 @@ class Indexer:
                 print(f"  ✓ 文档片段向量化完成")
             except KeyboardInterrupt:
                 print("\n[!]  Chunk嵌入被中断")
-                raise
+                # Chunk 嵌入中断不影响主索引
+                pass
+        
+        # 7. 最终保存（确保所有数据都已持久化）
+        if self._cogmem:
+            try:
+                print(f"  正在执行最终保存（图中有 {self._graph.num_entities()} 个节点）...")
+                self._cogmem.save()
+                print(f"  ✓ 最终保存完成")
+            except Exception as save_err:
+                print(f"  ⚠️  最终保存失败: {str(save_err)}")
+                # 不抛出异常，允许继续执行
 
     def _extract_structured_from_chunk(
         self,
@@ -650,8 +719,8 @@ class Indexer:
             week_key = (year, week_number)
 
             # Calculate week start (Monday) and week end (Sunday)
-            week_start = event_time - datetime.timedelta(days=event_time.weekday())
-            week_end = week_start + datetime.timedelta(days=6)
+            week_start = event_time - timedelta(days=event_time.weekday())
+            week_end = week_start + timedelta(days=6)
 
             week_start_str = week_start.strftime("%Y-%m-%d")
             week_end_str = week_end.strftime("%Y-%m-%d")
@@ -751,7 +820,8 @@ class Indexer:
                 if batch_embeddings:
                     all_embeddings.extend(batch_embeddings)
                     # 立即添加到向量库（避免内存占用过大）
-                    self._vstore.add(batch_nodes, batch_embeddings)
+                    batch_node_ids = [node.id for node in batch_nodes]
+                    self._vstore.add(batch_node_ids, batch_embeddings)
 
             print(f"  ✓ 节点向量化完成，共生成 {len(all_embeddings)} 个向量")
         except Exception as e:

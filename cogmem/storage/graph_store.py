@@ -9,7 +9,7 @@ from datetime import datetime
 import networkx as nx
 
 from .schema import (
-    BaseNode, NodeType, Entity, Relation, Person, Event, Fact, Preference, PersonFacet
+    BaseNode, NodeTypeEnum, Entity, Relation, Person, Event, Fact, Preference, PersonFacet
 )
 
 
@@ -774,22 +774,22 @@ class GraphStore:
         # Determine node type from the actual class or from BaseNode inheritance
         node_type_class = type(node).__name__
 
-        # Use NodeType enum for standardization (fallback to class name if not found)
+        # Use NodeTypeEnum for standardization (fallback to class name if not found)
         try:
             # For Entity nodes, we need to check the actual subtype
             if isinstance(node, Entity):
-                node_type = NodeType.ENTITY.value
+                node_type = NodeTypeEnum.ENTITY.value
             elif isinstance(node, Person):
-                node_type = NodeType.PERSON.value
+                node_type = NodeTypeEnum.PERSON.value
             elif isinstance(node, Event):
-                node_type = NodeType.EVENT.value
+                node_type = NodeTypeEnum.EVENT.value
             elif isinstance(node, Fact):
-                node_type = NodeType.FACT.value
+                node_type = NodeTypeEnum.FACT.value
             elif isinstance(node, Preference):
-                node_type = NodeType.PREFERENCE.value
+                node_type = NodeTypeEnum.PREFERENCE.value
             else:
-                # Fallback: try to map class name to NodeType
-                node_type = getattr(NodeType, node_type_class.upper(), NodeType.ENTITY).value
+                # Fallback: try to map class name to NodeTypeEnum
+                node_type = getattr(NodeTypeEnum, node_type_class.upper(), NodeTypeEnum.ENTITY).value
         except AttributeError:
             node_type = node_type_class.lower()
 
@@ -907,7 +907,7 @@ class GraphStore:
         facts = []
         for node_id, data in self._g.nodes(data=True):
             # Use node_type field with NodeType enum for type checking
-            if data.get("node_type") == NodeType.FACT.value:
+            if data.get("node_type") == NodeTypeEnum.FACT.value:
                 try:
                     fact = Fact(**data)
                     
@@ -951,7 +951,7 @@ class GraphStore:
         events = []
         for node_id, data in self._g.nodes(data=True):
             # Use node_type field with NodeType enum for type checking
-            if data.get("node_type") == NodeType.EVENT.value:
+            if data.get("node_type") == NodeTypeEnum.EVENT.value:
                 try:
                     event = Event(**data)
 
@@ -1072,7 +1072,7 @@ class GraphStore:
         events = []
 
         for node_id, data in self._g.nodes(data=True):
-            if data.get("node_type") == NodeType.EVENT.value:
+            if data.get("node_type") == NodeTypeEnum.EVENT.value:
                 try:
                     event = Event(**data)
 
@@ -1112,7 +1112,7 @@ class GraphStore:
         facts = []
 
         for node_id, data in self._g.nodes(data=True):
-            if data.get("node_type") == NodeType.FACT.value:
+            if data.get("node_type") == NodeTypeEnum.FACT.value:
                 try:
                     fact = Fact(**data)
 

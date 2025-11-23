@@ -54,7 +54,6 @@ class AnswerAgent:
         """
         # 格式化证据
         formatted_evidence = self._format_evidence_for_qa(retrieval_result.evidence)
-
         # 构建证据统计信息（帮助模型判断）
         evidence_stats = {
             "num_entities": len(retrieval_result.entities),

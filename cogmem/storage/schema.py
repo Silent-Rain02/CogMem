@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Dict, List, Literal, Optional, Union, Tuple, Any
-from pydantic import BaseModel, Field, field_validator, ValidationInfo
+from pydantic import BaseModel, Field, field_validator, ValidationInfo, model_validator
 
 
 # ============================================================================
@@ -122,7 +122,7 @@ class BaseNode(BaseModel):
     """
     id: str = Field(description="Unique node ID with type prefix (e.g., 'person_abc123')")
     content: str = Field(default="", description="Core textual content or description")
-    timestamp: Optional[str] = Field(None, description="ISO-8601 timestamp for temporal nodes")
+    timestamp: Optional[str] = Field(None, description="ISO-8601 timestamp for temporal nodes", exclude=True)  # Exclude from serialization by default
     topic_id: Optional[str] = Field(None, description="Topic classification ID")
     is_archived: bool = Field(default=False, description="Whether this node is archived")
     metadata: Metadata = Field(default_factory=Metadata, description="Creation and update metadata")
@@ -152,12 +152,17 @@ class BaseNode(BaseModel):
 
         return v
 
-    @field_validator('timestamp')
+    @field_validator('timestamp', mode='before')
     @classmethod
     def validate_timestamp(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
         """Validate ISO-8601 timestamp format"""
         if v is None:
             return v
+        
+        # Skip validation if it's a property object (from Event class override)
+        # This happens when a subclass defines @property timestamp
+        if hasattr(v, '__get__') or str(type(v)) == "<class 'property'>":
+            return None
 
         from datetime import datetime
         try:
@@ -166,7 +171,10 @@ class BaseNode(BaseModel):
             else:
                 datetime.strptime(v, "%Y-%m-%d")
             return v
-        except ValueError:
+        except (ValueError, TypeError):
+            # If validation fails and it's not a string, return None (for property objects)
+            if not isinstance(v, str):
+                return None
             raise ValueError(
                 f'Invalid ISO-8601 timestamp format: {v}. '
                 f'Expected: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS'
@@ -237,6 +245,8 @@ class RetrievalResult(BaseModel):
     retrieval_path: List[str] = Field(default_factory=list)  # Retrieval strategy steps used (e.g., "entity-extraction", "exact-match", "community-expansion", "graph-traversal", "query-rerank", "chunk-search")
     candidates: List[Any] = Field(default_factory=list)  # (node_id, node_type, node_obj, graph_distance)
     reranked_candidates: List[Any] = Field(default_factory=list)  # (node_id, node_type, node_obj, score, breakdown)
+    matched_topics: List[Tuple[Any, float]] = Field(default_factory=list)  # List of (Topic, similarity_score) from topic matching phase
+    confidence: float = Field(default=0.0, description="Confidence score for the retrieval result")
 
 
 # Rebuild the model to handle forward references
@@ -329,18 +339,58 @@ class Event(BaseNode):
     source_session_id: Optional[str] = Field(None, description="Source session ID")
     source_turn_id: Optional[str] = Field(None, description="Source turn ID")
     community_ids: List[str] = Field(default_factory=list, description="Community memberships")
+    
+    # Override BaseNode's timestamp field - exclude it from model fields
+    model_config = {
+        "validate_assignment": True,
+        "validate_default": True,
+    }
+
+    @model_validator(mode='before')
+    @classmethod
+    def exclude_timestamp_from_input(cls, data: Any) -> Any:
+        """Remove timestamp from input data since it's a computed property from BaseNode"""
+        if isinstance(data, dict) and 'timestamp' in data:
+            # Remove timestamp field - it will be computed from time_start/time_end
+            data = {k: v for k, v in data.items() if k != 'timestamp'}
+        return data
 
     @property
     def timestamp(self) -> Optional[str]:
         """Primary timestamp for the event (time_start if available, otherwise time_end)"""
         return self.time_start or self.time_end
+    
+    def model_dump(self, **kwargs) -> Dict[str, Any]:
+        """Override model_dump to include computed timestamp"""
+        data = super().model_dump(**kwargs)
+        data['timestamp'] = self.timestamp
+        return data
 
     @field_validator('time_start', 'time_end')
     @classmethod
     def validate_iso_datetime(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
-        """Validate ISO-8601 datetime format for temporal fields"""
+        """Validate ISO-8601 datetime format for temporal fields
+        
+        Supports:
+        - Full datetime: YYYY-MM-DDTHH:MM:SS
+        - Date only: YYYY-MM-DD
+        - Partial dates: YYYY-MM-XX (for approximate dates)
+        """
         if v is None:
             return v
+
+        # Allow partial dates (YYYY-MM-XX) for approximate dates
+        if v.endswith('-XX'):
+            # Validate format: YYYY-MM-XX
+            parts = v.split('-')
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2] == 'XX':
+                try:
+                    year = int(parts[0])
+                    month = int(parts[1])
+                    if 1 <= month <= 12 and 1900 <= year <= 2100:
+                        return v
+                except ValueError:
+                    pass
 
         # Try to parse as ISO datetime
         from datetime import datetime
@@ -356,7 +406,7 @@ class Event(BaseNode):
         except ValueError:
             raise ValueError(
                 f'Invalid ISO-8601 datetime format: {v}. '
-                f'Expected format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS'
+                f'Expected format: YYYY-MM-DD, YYYY-MM-XX, or YYYY-MM-DDTHH:MM:SS'
             )
 
     @field_validator('id')

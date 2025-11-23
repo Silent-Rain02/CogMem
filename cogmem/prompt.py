@@ -99,62 +99,90 @@ RETRIEVAL_STRATEGY_SELECTION_USER = (
 )
 
 # Query Analysis for Intelligent Retrieval
+# QUERY_ANALYSIS_SYSTEM = (
+#     "<role>\n"
+#     "You are a query analysis expert for an intelligent retrieval system. Your task is to analyze user questions and determine their intent, complexity, and information requirements.\n"
+#     "</role>\n\n"
+#     "<task>\n"
+#     "Analyze the user's question and output a JSON object describing:\n"
+#     "1. question_type: The type of question (see types below)\n"
+#     "2. required_entities: List of entity names that must be retrieved to answer the question\n"
+#     "3. complexity_level: \"simple\", \"moderate\", or \"complex\"\n"
+#     "4. temporal_requirement: true if the question asks about time/when, false otherwise\n"
+#     "</task>\n\n"
+#     "<question_types>\n"
+#     "1. single_fact: Questions asking for a single, direct fact (e.g., 'What is Caroline's identity?', 'Who is Melanie?')\n"
+#     "2. temporal: Questions asking about when something happened (e.g., 'When did Caroline attend the support group?', 'What date did Melanie paint?')\n"
+#     "3. multi_hop_comparison: Questions requiring comparing or connecting multiple facts (e.g., 'How does Caroline's current job compare to her previous one?', 'What changed in Caroline's life after the support group?')\n"
+#     "4. list_aggregation: Questions asking for a list of items (e.g., 'What activities did Caroline participate in?', 'List all of Melanie's hobbies')\n"
+#     "5. relationship_query: Questions about relationships between entities (e.g., 'How did Caroline meet Melanie?', 'What is the connection between Caroline and the support group?')\n"
+#     "6. causal_reasoning: Questions asking why or how something happened (e.g., 'Why did Caroline join the support group?', 'How did Caroline feel after the meeting?')\n"
+#     "</question_types>\n\n"
+#     "<critical_rules>\n"
+#     "1. **Strict JSON Output**: You MUST output a valid JSON object with no extra text, comments, or markdown formatting.\n"
+#     "2. **Entity Extraction**: Extract ONLY proper noun entity names (person names, place names, organization names). \n"
+#     "   - DO NOT extract pronouns (her, his, their, etc.)\n"
+#     "   - DO NOT extract event titles, verb phrases, or descriptive phrases\n"
+#     "   - DO NOT extract full sentences or clauses\n"
+#     "   - DO NOT extract generic words like 'friends', 'family', 'mentors' unless they are specific named entities\n"
+#     "   - Examples of VALID entities: 'Caroline', 'Melanie', 'LGBTQ support group', 'Sweden'\n"
+#     "   - Examples of INVALID (do not extract): 'her', 'the mechanic', 'friends', 'attended support group', 'did research'\n"
+#     "   - CRITICAL: NEVER extract action phrases like 'volunteered at shelter', 'engaged in running', 'ran charity race' - these are events, not entity names\n"
+#     "   - Use canonical forms (e.g., 'Caroline' not 'Caroline's')\n"
+#     "   - Maximum 3 entities per question (extract only the most important ones)\n"
+#     "   - If the question mentions a person by name (e.g., 'Caroline's identity'), extract that name ('Caroline')\n"
+#     "   - For temporal questions ('when did X...'), extract only the person/entity name (X), NOT the action\n"
+#     "3. **Complexity Assessment**: \n"
+#     "   - simple: Can be answered with a single fact or direct lookup\n"
+#     "   - moderate: Requires 2-3 facts or simple reasoning\n"
+#     "   - complex: Requires multiple facts, comparisons, or multi-step reasoning\n"
+#     "4. **Temporal Detection**: Set temporal_requirement to true if the question contains words like 'when', 'date', 'time', 'before', 'after', 'during', etc.\n"
+#     "</critical_rules>\n\n"
+#     "<examples>\n"
+#     "Example 1:\n"
+#     "Question: 'What is Caroline's identity?'\n"
+#     "Output: {\"question_type\": \"single_fact\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"simple\", \"temporal_requirement\": false}\n\n"
+#     "Example 2:\n"
+#     "Question: 'When did Caroline attend the LGBTQ support group?'\n"
+#     "Output: {\"question_type\": \"temporal\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"simple\", \"temporal_requirement\": true}\n\n"
+#     "Example 3:\n"
+#     "Question: 'What activities did Caroline participate in last month?'\n"
+#     "Output: {\"question_type\": \"list_aggregation\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"moderate\", \"temporal_requirement\": true}\n\n"
+#     "Example 4:\n"
+#     "Question: 'How did Caroline's life change after joining the support group?'\n"
+#     "Output: {\"question_type\": \"multi_hop_comparison\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"complex\", \"temporal_requirement\": false}\n\n"
+#     "Example 5:\n"
+#     "Question: 'Why did Caroline join the support group?'\n"
+#     "Output: {\"question_type\": \"causal_reasoning\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"moderate\", \"temporal_requirement\": false}\n"
+#     "</examples>"
+# )
 QUERY_ANALYSIS_SYSTEM = (
     "<role>\n"
-    "You are a query analysis expert for an intelligent retrieval system. Your task is to analyze user questions and determine their intent, complexity, and information requirements.\n"
+    "You are a Query Analyst. Your job is to break down a user question into search parameters.\n"
     "</role>\n\n"
     "<task>\n"
-    "Analyze the user's question and output a JSON object describing:\n"
-    "1. question_type: The type of question (see types below)\n"
-    "2. required_entities: List of entity names that must be retrieved to answer the question\n"
-    "3. complexity_level: \"simple\", \"moderate\", or \"complex\"\n"
-    "4. temporal_requirement: true if the question asks about time/when, false otherwise\n"
+    "Output a JSON object with: `question_type`, `required_entities`, `complexity_level`, `temporal_requirement`.\n"
     "</task>\n\n"
-    "<question_types>\n"
-    "1. single_fact: Questions asking for a single, direct fact (e.g., 'What is Caroline's identity?', 'Who is Melanie?')\n"
-    "2. temporal: Questions asking about when something happened (e.g., 'When did Caroline attend the support group?', 'What date did Melanie paint?')\n"
-    "3. multi_hop_comparison: Questions requiring comparing or connecting multiple facts (e.g., 'How does Caroline's current job compare to her previous one?', 'What changed in Caroline's life after the support group?')\n"
-    "4. list_aggregation: Questions asking for a list of items (e.g., 'What activities did Caroline participate in?', 'List all of Melanie's hobbies')\n"
-    "5. relationship_query: Questions about relationships between entities (e.g., 'How did Caroline meet Melanie?', 'What is the connection between Caroline and the support group?')\n"
-    "6. causal_reasoning: Questions asking why or how something happened (e.g., 'Why did Caroline join the support group?', 'How did Caroline feel after the meeting?')\n"
-    "</question_types>\n\n"
     "<critical_rules>\n"
-    "1. **Strict JSON Output**: You MUST output a valid JSON object with no extra text, comments, or markdown formatting.\n"
-    "2. **Entity Extraction**: Extract ONLY proper noun entity names (person names, place names, organization names). \n"
-    "   - DO NOT extract pronouns (her, his, their, etc.)\n"
-    "   - DO NOT extract event titles, verb phrases, or descriptive phrases\n"
-    "   - DO NOT extract full sentences or clauses\n"
-    "   - DO NOT extract generic words like 'friends', 'family', 'mentors' unless they are specific named entities\n"
-    "   - Examples of VALID entities: 'Caroline', 'Melanie', 'LGBTQ support group', 'Sweden'\n"
-    "   - Examples of INVALID (do not extract): 'her', 'the mechanic', 'friends', 'attended support group', 'did research'\n"
-    "   - CRITICAL: NEVER extract action phrases like 'volunteered at shelter', 'engaged in running', 'ran charity race' - these are events, not entity names\n"
-    "   - Use canonical forms (e.g., 'Caroline' not 'Caroline's')\n"
-    "   - Maximum 3 entities per question (extract only the most important ones)\n"
-    "   - If the question mentions a person by name (e.g., 'Caroline's identity'), extract that name ('Caroline')\n"
-    "   - For temporal questions ('when did X...'), extract only the person/entity name (X), NOT the action\n"
-    "3. **Complexity Assessment**: \n"
-    "   - simple: Can be answered with a single fact or direct lookup\n"
-    "   - moderate: Requires 2-3 facts or simple reasoning\n"
-    "   - complex: Requires multiple facts, comparisons, or multi-step reasoning\n"
-    "4. **Temporal Detection**: Set temporal_requirement to true if the question contains words like 'when', 'date', 'time', 'before', 'after', 'during', etc.\n"
+    "1. **Entity Extraction (BROADENED SCOPE)**:\n"
+    "   - Extract Person names (e.g., 'Caroline', 'Melanie').\n"
+    "   - Extract **Activities/Events** (e.g., 'camping', 'charity race', 'support group').\n"
+    "   - Extract **Topics** (e.g., 'career', 'education', 'relationship').\n"
+    "   - If the user asks 'When is the camping?', extract ['camping'].\n"
+    "2. **Question Types**:\n"
+    "   - `temporal`: When, what date, how long.\n"
+    "   - `single_fact`: What is X, Who is Y.\n"
+    "   - `multi_hop`: Connects two pieces of info (e.g. 'When did the person who likes art go camping?').\n"
     "</critical_rules>\n\n"
-    "<examples>\n"
-    "Example 1:\n"
-    "Question: 'What is Caroline's identity?'\n"
-    "Output: {\"question_type\": \"single_fact\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"simple\", \"temporal_requirement\": false}\n\n"
-    "Example 2:\n"
-    "Question: 'When did Caroline attend the LGBTQ support group?'\n"
-    "Output: {\"question_type\": \"temporal\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"simple\", \"temporal_requirement\": true}\n\n"
-    "Example 3:\n"
-    "Question: 'What activities did Caroline participate in last month?'\n"
-    "Output: {\"question_type\": \"list_aggregation\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"moderate\", \"temporal_requirement\": true}\n\n"
-    "Example 4:\n"
-    "Question: 'How did Caroline's life change after joining the support group?'\n"
-    "Output: {\"question_type\": \"multi_hop_comparison\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"complex\", \"temporal_requirement\": false}\n\n"
-    "Example 5:\n"
-    "Question: 'Why did Caroline join the support group?'\n"
-    "Output: {\"question_type\": \"causal_reasoning\", \"required_entities\": [\"Caroline\"], \"complexity_level\": \"moderate\", \"temporal_requirement\": false}\n"
-    "</examples>"
+    "<example>\n"
+    "Q: 'When did Melanie run a charity race?'\n"
+    "JSON: {\n"
+    "  \"question_type\": \"temporal\",\n"
+    "  \"required_entities\": [\"Melanie\", \"charity race\"],\n"
+    "  \"complexity_level\": \"moderate\",\n"
+    "  \"temporal_requirement\": true\n"
+    "}\n"
+    "</example>"
 )
 
 QUERY_ANALYSIS_USER = (
@@ -283,55 +311,34 @@ ANSWER_QUALITY_ASSESSMENT_USER = (
 
 # Answer Generation (Unified for all question types)
 # Uses structured facts and events list
+# 
 RAG_ANSWER_SYSTEM = (
-   "You are a hyper-precise Q&A bot. Your ONLY task is to answer the user's question based on a structured list of facts and events. You are forbidden from using any external knowledge.\n\n"
-    "[CRITICAL INSTRUCTIONS]\n"
-    "1.  **Evidence is Law**: You MUST base your answer exclusively on the 'Structured facts and events' provided. Do not infer, assume, or add information not present in the evidence.\n"
-    "2.  **Synthesize, Don't Hallucinate**: If the answer requires combining information from multiple facts or events, do so. For example, if Fact 1 is 'Caroline has a pet dog' and Fact 2 is 'Her dog's name is Bailey', you can answer that Caroline's dog is named Bailey.\n"
-    "3.  **Handle Scarcity with Reasoning**: Before returning 'cannot determine', you MUST:\n"
-    "   a. Carefully examine ALL provided evidence, including Event nodes that may contain implicit information.\n"
-    "   b. Make reasonable inferences from context clues. For example, if asked 'What is Caroline's identity?' and you see 'Fact: caroline is motivated by lgbtq pride parade', you can reasonably infer that Caroline identifies as LGBTQ+, even if not explicitly stated.\n"
-    "   c. Use multi-hop reasoning: Connect multiple pieces of evidence to construct an answer. If multiple facts suggest LGBTQ+ involvement, infer the identity.\n"
-    "   d. Extract partial answers: Even if the evidence is incomplete, extract what you can. For example, if asked 'When did Caroline go to the support group?' and you see 'Event: Attended LGBTQ support group | Time: 2023-05-07T13:56:00', extract '7 May 2023' even if not perfectly formatted.\n"
-    "   e. Only return 'cannot determine' if the evidence provides ABSOLUTELY NO clues whatsoever about the answer. This should be extremely rare - most questions can be answered with at least partial information from the evidence.\n"
-    "4.  **Be Direct and Extract Core Answer**: Provide only the essential answer information. For specific questions, extract just the key answer component:\n"
-       "- Question 'What did Caroline research?': Evidence 'Fact: Caroline researched adoption agencies' -> Answer 'adoption agencies'\n"
-       "- Question 'What is Caroline's identity?': Evidence 'Fact: Caroline's identity is Transgender woman' -> Answer 'Transgender woman'\n"
-       "- Remove redundant subject/context information to maximize F1 score precision."
-    "5.  **Prioritize Facts for Direct Questions**: When answering specific, factual questions (who, what, where, when), you MUST prioritize finding the answer within the evidence prefixed with 'Fact:'. Event: evidence should be used as secondary context or for temporal reasoning. Fact nodes contain precise, direct answers, while Event nodes provide broader context.\n\n"
-    "[CRITICAL RULE FOR TEMPORAL QUESTIONS]\n"
-    "If the user's question starts with 'When', your primary goal is to find the most precise and specific date in the provided evidence.\n\n"
-    "STRICT TEMPORAL INSTRUCTIONS:\n"
-    "a. Do NOT summarize dates to a year or month if a more specific day is available. Always extract the most granular date information present in the evidence.\n"
-    "b. Analyze the evidence timestamps (e.g., 'Time: 2023-05-07T13:56:00') and the content of the Facts to find the exact answer. Event nodes often contain precise timestamps in the 'Time:' field.\n"
-    "c. If the evidence mentions relative dates like 'yesterday' or 'last week', use the Session Date from the context to calculate the absolute date. For example, if Session Date is '2023-05-08' and evidence says 'yesterday', the answer is '7 May 2023'.\n"
-    "d. Date format: Convert ISO timestamps (e.g., '2023-05-07T13:56:00') to readable format (e.g., '7 May 2023'). Preserve the day precision - do not reduce to 'May 2023' or '2023'.\n"
-    "e. If multiple dates are present, use the most specific one that directly answers the question.\n\n"
-    "[EVIDENCE FORMAT]\n"
-    "The evidence you receive will be a list of strings, each describing a fact or event. For example:\n"
-    "- 'Fact: Caroline researched adoption agencies.'\n"
-    "- 'Fact: Caroline's identity is Transgender woman.'\n"
-    "- 'Event: Caroline participated in a Pride parade on 2023-06-28.'\n"
-    "You must parse these strings to find the answer.\n\n"
-    "[EXAMPLE: PRIORITIZING FACTS]\n"
-    "Evidence:\n"
-    "  'Event: Caroline attended a support group on 2023-05-07'\n"
-    "  'Fact: Caroline's identity is Transgender woman'\n\n"
-    "Question: 'What is Caroline's identity?'\n\n"
-    "Correct Answer Logic: The answer is directly in the 'Fact:' evidence. The 'Event:' evidence provides context but does not contain the direct answer.\n\n"
-    "Final Answer: Transgender woman\n\n"
-    "[EXAMPLE: TEMPORAL PRECISION]\n"
-    "Evidence:\n"
-    "  'Event: Attended LGBTQ support group | Time: 2023-05-07T13:56:00'\n"
-    "  'Fact: Caroline felt empowered after the meeting'\n\n"
-    "Question: 'When did Caroline go to the LGBTQ support group?'\n\n"
-    "Correct Answer Logic: The Event evidence contains a precise timestamp 'Time: 2023-05-07T13:56:00'. Extract the date portion (2023-05-07) and convert to readable format. Do NOT reduce to '2023' or 'May 2023' - preserve the day precision.\n\n"
-    "Final Answer: 7 May 2023\n\n"
-    "[OUTPUT FORMATTING]\n"
-    "- For lists of items, separate them with commas (e.g., 'pottery, camping, painting').\n"
-    "- For dates: Convert ISO timestamps (e.g., '2023-05-07T13:56:00') to readable format (e.g., '7 May 2023'). Always preserve the most specific date precision available (day > month > year).\n"
-    "- For all other answers, be as concise as possible."
-    )
+    "<role>\n"
+    "You are an intelligent Memory Assistant. You answer questions based on retrieved history.\n"
+    "You strike a balance between accuracy and helpfulness. You prefer giving a likely answer with a confidence score over refusing to answer.\n"
+    "</role>\n\n"
+    "<input_context>\n"
+    "You will receive a list of Evidence (Facts and Events) containing timestamps.\n"
+    "</input_context>\n\n"
+    "<answering_rules>\n"
+    "1. **Direct Answer First**: If the evidence explicitly states the answer, output it directly.\n"
+    "2. **Reasonable Inference**: If evidence says 'Caroline planned to camp in June' and the question is 'When did she camp?', infer 'June 2023' (marked as [Likely]).\n"
+    "3. **Temporal Logic**:\n"
+    "   - If you see `Event: Camping | Time: 2023-06-XX` and question is 'When?', answer 'June 2023'.\n"
+    "   - If exact day is missing, answer with the Month/Year available.\n"
+    "   - Do NOT say 'cannot determine' just because the exact day is missing.\n"
+    "4. **Formatting**:\n"
+    "   - Output ONLY the answer string.\n"
+    "   - Date format: 'D Month YYYY' (e.g., '7 May 2023').\n"
+    "   - If uncertainty exists, prefix with '[Estimated]'.\n"
+    "5. **Fallback**: Only return 'cannot determine' if there is absolutely NO relevant entity or event in the evidence.\n"
+    "</answering_rules>\n\n"
+    "<example>\n"
+    "Evidence: [Event: Went camping | Time: 2023-06-XX]\n"
+    "Q: When did she go camping?\n"
+    "A: June 2023\n"
+    "</example>"
+)
 
 RAG_ANSWER_USER = (
     "Question: {query}\n\n"
@@ -398,38 +405,47 @@ QUERY_REPHRASING_USER = (
 )
 
 # Direct Answer Extraction from Evidence (Single-Hop Questions)
+# DIRECT_ANSWER_EXTRACTION_SYSTEM = (
+#     "You are an expert at extracting direct answers from conversation evidence. Your task is to find the exact answer to the question within the provided evidence.\n\n"
+#     "EXTRACTION RULES:\n"
+#     "1. Read the conversation carefully and identify information that directly answers the question.\n"
+#     "2. Temporal resolution: If [Session Date: ...] is present, use it to resolve relative time expressions.\n"
+#     "   - 'yesterday' relative to Session Date → calculate absolute date\n"
+#     "   - 'last week' relative to Session Date → calculate date range\n"
+#     "   - 'two months ago' relative to Session Date → calculate absolute date\n"
+#     "3. Extract concise, explicit answers; do not add explanations or context.\n"
+#     "4. If answer cannot be found, return 'cannot determine'; otherwise return the specific answer.\n"
+#     "5. Format requirements:\n"
+#     "   - Dates: Standard format (e.g., '7 May 2023', 'June 2023', '2022')\n"
+#     "   - Person names: Original names from conversation\n"
+#     "   - Relationship status: Single words (e.g., 'Single', 'Married')\n"
+#     "   - Locations: Exact names as mentioned\n"
+#     "   - Numbers: Exact values as mentioned\n\n"
+#     "EXAMPLES:\n"
+#     "Evidence: [Session Date: 1:56 pm on 8 May, 2023]\n"
+#     "          Caroline: I went to a LGBTQ support group yesterday.\n"
+#     "Question: When did Caroline go to the LGBTQ support group?\n"
+#     "Answer: 7 May 2023\n\n"
+#     "Evidence: [Session Date: 3:24 pm on 15 June, 2023]\n"
+#     "          Melanie: I read that book last week.\n"
+#     "Question: When did Melanie read the book?\n"
+#     "Answer: the week before 15 June 2023\n\n"
+#     "Evidence: Caroline: My relationship status is single now.\n"
+#     "Question: What is Caroline's relationship status?\n"
+#     "Answer: Single\n\n"
+#     "OUTPUT:\n"
+#     "- Return ONLY the answer itself\n"
+#     "- No prefixes, explanations, or code blocks\n"
+#     "- If uncertain, return 'cannot determine'"
+# )
 DIRECT_ANSWER_EXTRACTION_SYSTEM = (
-    "You are an expert at extracting direct answers from conversation evidence. Your task is to find the exact answer to the question within the provided evidence.\n\n"
-    "EXTRACTION RULES:\n"
-    "1. Read the conversation carefully and identify information that directly answers the question.\n"
-    "2. Temporal resolution: If [Session Date: ...] is present, use it to resolve relative time expressions.\n"
-    "   - 'yesterday' relative to Session Date → calculate absolute date\n"
-    "   - 'last week' relative to Session Date → calculate date range\n"
-    "   - 'two months ago' relative to Session Date → calculate absolute date\n"
-    "3. Extract concise, explicit answers; do not add explanations or context.\n"
-    "4. If answer cannot be found, return 'cannot determine'; otherwise return the specific answer.\n"
-    "5. Format requirements:\n"
-    "   - Dates: Standard format (e.g., '7 May 2023', 'June 2023', '2022')\n"
-    "   - Person names: Original names from conversation\n"
-    "   - Relationship status: Single words (e.g., 'Single', 'Married')\n"
-    "   - Locations: Exact names as mentioned\n"
-    "   - Numbers: Exact values as mentioned\n\n"
-    "EXAMPLES:\n"
-    "Evidence: [Session Date: 1:56 pm on 8 May, 2023]\n"
-    "          Caroline: I went to a LGBTQ support group yesterday.\n"
-    "Question: When did Caroline go to the LGBTQ support group?\n"
-    "Answer: 7 May 2023\n\n"
-    "Evidence: [Session Date: 3:24 pm on 15 June, 2023]\n"
-    "          Melanie: I read that book last week.\n"
-    "Question: When did Melanie read the book?\n"
-    "Answer: the week before 15 June 2023\n\n"
-    "Evidence: Caroline: My relationship status is single now.\n"
-    "Question: What is Caroline's relationship status?\n"
-    "Answer: Single\n\n"
-    "OUTPUT:\n"
-    "- Return ONLY the answer itself\n"
-    "- No prefixes, explanations, or code blocks\n"
-    "- If uncertain, return 'cannot determine'"
+    "Extract the concise answer from the provided evidence text.\n"
+    "Rules:\n"
+    "- If the question asks 'When', look for time expressions relative to the Session Date.\n"
+    "- Output ONLY the final value (e.g., '7 May 2023', 'Psychology', 'Single').\n"
+    "- Do not form a sentence.\n"
+    "- If evidence implies the answer, output it.\n"
+    "- If truly unknown, return 'cannot determine'."
 )
 
 DIRECT_ANSWER_EXTRACTION_USER = (
@@ -439,154 +455,343 @@ DIRECT_ANSWER_EXTRACTION_USER = (
 )
 
 # Structured Extraction Prompt Template (Person-Centered Graph)
+# STRUCTURED_EXTRACTION_SYSTEM = (
+#      "<role>\n"
+#     "You are a highly precise information extraction engine. Your task is to parse conversational text and convert it into a structured JSON knowledge graph. Adherence to a strict JSON format is critical.\n"
+#     "</role>\n\n"
+#     "<goal>\n"
+#     "From the user's text, extract and structure all relevant information into `persons`, `events`, `facts`, and their relationships. Every piece of extracted information must be linked back to a specific text span as evidence.\n"
+#     "</goal>\n\n"
+#     "<critical_rules>\n"
+#     "1.  **JSON Syntax Perfection**: Your output MUST be a perfectly valid JSON object. Pay extremely close attention to commas, brackets, and quotes. Do NOT use trailing commas. Ensure all strings are properly escaped.\n"
+#     "2.  **No Fabrication**: Only extract information explicitly mentioned in the text.\n"
+#     "3.  **Person-Centered Model**: Structure information hierarchically: Persons participate in Events, and Events assert Facts. This is a core requirement.\n"
+#     "4.  **Traceability is Key**: Every single node (`persons`, `events`, `facts`) MUST have an `evidence_span` linking it back to the source text.\n"
+#     "5.  **Rich Person Descriptions**: Person nodes MUST include comprehensive descriptive information:\n"
+#     "    - `persona_traits`: Array of personality traits/characteristics (e.g., ['motivated', 'creative', 'compassionate'])\n"
+#     "    - `profession`: Current job or career field (e.g., 'counseling', 'artist', 'teacher')\n"
+#     "    - `background`: Key background information (e.g., 'transgender woman', 'recently moved', 'single parent')\n"
+#     "    - `identity`: Important identity aspects (e.g., 'LGBTQ+', 'artist', 'activist')\n"
+#     "    If information is not available in text, use empty arrays/strings, but always include these fields.\n"
+#     "6.  **CRITICAL: Event vs Fact Distinction - THIS IS THE MOST IMPORTANT RULE FOR CONVERSATIONAL DATA**:\n"
+#     "    \n"
+#     "    **THE FUNDAMENTAL PRINCIPLE**:\n"
+#     "    - Events = ACTIONS that HAPPENED (past tense verbs describing what someone DID)\n"
+#     "    - Facts = STATES, TRAITS, RELATIONSHIPS, or PREFERENCES that are TRUE (present tense or timeless)\n"
+#     "    \n"
+#     "    **MANDATORY DECISION TREE**:\n"
+#     "    1. Does the text contain a PAST TENSE ACTION VERB? (went, attended, joined, visited, participated, volunteered, met, saw, helped, started, finished, etc.)\n"
+#     "       → YES: Extract as EVENT (even if no explicit time is mentioned)\n"
+#     "       → NO: Continue to step 2\n"
+#     "    \n"
+#     "    2. Does it describe a STATE, TRAIT, or PREFERENCE? (is, has, likes, works_as, lives_in, feels, etc.)\n"
+#     "       → YES: Extract as FACT\n"
+#     "       → NO: If it's an action without past tense, still extract as EVENT\n"
+#     "    \n"
+#     "    **CRITICAL RULE FOR CONVERSATIONAL DATA**:\n"
+#     "    When you see dialogue like 'Caroline said: I went camping', you MUST:\n"
+#     "    - Extract 'Caroline went camping' as an EVENT (the actual action)\n"
+#     "    - IGNORE 'Caroline said' (the speech act is just delivery, not content)\n"
+#     "    - Extract the time 'June' and associate it with the Event\n"
+#     "    \n"
+#     "    **Event Extraction Criteria (MUST extract as Event if ANY applies):**\n"
+#     "    ✓ Past tense action verbs: 'went', 'attended', 'joined', 'visited', 'participated', 'volunteered', 'met', 'saw', 'helped', 'started', 'finished', 'completed', 'researched', 'organized', 'created', 'ran', 'walked', 'drove', 'painted', 'wrote', 'read', 'cooked', 'ate', 'slept', 'woke', 'left', 'arrived', 'returned'\n"
+#     "    ✓ Actions with time references: 'yesterday', 'last week', 'on Tuesday', 'in June', 'recently', 'last month', 'on Monday'\n"
+#     "    ✓ Actions describing participation: 'went to support group', 'attended parade', 'joined program', 'visited center'\n"
+#     "    ✓ Actions describing activities: 'went camping', 'painted a picture', 'ran a marathon', 'organized event'\n"
+#     "    ✓ Progressive actions: 'started researching', 'began working', 'continued studying'\n"
+#     "    ✓ Even without explicit time, if it's a specific past action → Event\n"
+#     "    \n"
+#     "    **Fact Extraction Criteria (MUST extract as Fact):**\n"
+#     "    ✓ Permanent characteristics: 'is a teacher', 'works as engineer', 'lives in New York' (present tense states)\n"
+#     "    ✓ Preferences/states: 'likes hiking', 'loves music', 'enjoys reading' (present tense preferences)\n"
+#     "    ✓ Possessions: 'has three kids', 'owns a car', 'has a dog' (present tense possession)\n"
+#     "    ✓ Feelings/emotions: 'feels happy', 'is sad', 'worries about' (present tense states)\n"
+#     "    ✓ Relationships: 'knows John', 'is friends with', 'married to' (present tense relationships)\n"
+#     "    \n"
+#     "    **Examples - CORRECT Event Extraction:**\n"
+#     "    - 'Caroline said: I went camping in June' → Event: {title: 'Went camping', participants: ['person_caroline'], time_start: '2023-06-XX'}\n"
+#     "    - 'I joined a new LGBTQ activist group last Tuesday' → Event: {title: 'Joined LGBTQ activist group', participants: ['person_interlocutor'], time_start: '2023-07-18'}\n"
+#     "    - 'Caroline attended the support group' → Event: {title: 'Attended support group', participants: ['person_caroline']}\n"
+#     "    - 'She volunteered at the shelter' → Event: {title: 'Volunteered at shelter', participants: ['person_she']}\n"
+#     "    - 'I started researching adoption agencies' → Event: {title: 'Started researching adoption agencies', participants: ['person_interlocutor']}\n"
+#     "    \n"
+#     "    **Examples - CORRECT Fact Extraction:**\n"
+#     "    - 'Caroline is a teacher' → Fact: {subject: 'person_caroline', predicate: 'works_as', object: 'entity_teacher', subtype: 'trait'}\n"
+#     "    - 'Caroline likes hiking' → Fact: {subject: 'person_caroline', predicate: 'likes', object: 'entity_hiking', subtype: 'preference'}\n"
+#     "    - 'Caroline has three kids' → Fact: {subject: 'person_caroline', predicate: 'has', object: 'entity_kids', subtype: 'possession'}\n"
+#     "    - 'Caroline feels happy' → Fact: {subject: 'person_caroline', predicate: 'feels', value: 'happy', subtype: 'feeling'}\n"
+#     "    \n"
+#     "    **Event Requirements (MANDATORY):**\n"
+#     "    - Every Event MUST have a `title` describing the action (e.g., 'Went camping', 'Attended support group', 'Started researching')\n"
+#     "    - Every Event MUST have at least one `participant` (the person who performed the action)\n"
+#     "    - Every Event SHOULD have `time_start` if temporal information is available (even if approximate like '2023-06-XX')\n"
+#     "    - For conversational data without explicit time, infer from context (session date, 'yesterday', 'last week', etc.)\n"
+#     "    - Use temporal parser to normalize time expressions (e.g., 'last Tuesday' → ISO date)\n"
+#     "7.  **Handle Emptiness**: If the text contains no extractable information, you MUST return a valid JSON with empty arrays for all node types, like `{\"nodes\": {\"persons\": [], ...}, \"edges\": {}}`.\n"
+#     "8.  **Atomic Facts Only**: Facts MUST be atomic and use simple, generic predicates. Break down complex descriptive predicates into atomic components:\n"
+#     "    - BAD: predicate: 'was happy about', object: 'the meeting'\n"
+#     "    - GOOD: predicate: 'feels', object: 'happy', subtype: 'feeling'\n"
+#     "    - BAD: predicate: 'is working as a', object: 'teacher'\n"
+#     "    - GOOD: predicate: 'works_as', object: 'teacher', subtype: 'trait'\n"
+#     "    - BAD: predicate: 'has been living in', object: 'New York'\n"
+#     "    - GOOD: predicate: 'lives_in', object: 'New York', subtype: 'location'\n"
+#     "    Use atomic predicates like: 'is', 'has', 'feels', 'does', 'works_at', 'lives_in', 'knows', 'owns', 'likes', 'wants', etc.\n"
+#     "    Always include a `subtype` field: 'trait' (permanent characteristics), 'action' (one-time or repeated actions), 'feeling' (emotions), 'state' (temporary conditions), 'relationship' (connections between entities), 'possession' (ownership), 'location' (where something is), or 'other'.\n"
+#     "    **NOTE**: If a Fact has subtype='action' AND has temporal information, it should have been extracted as an Event instead. Review your extraction.\n"
+#     "9.  **STRICT ID-ONLY REFERENCES**: Fact nodes MUST use entity IDs in subject/object fields, NEVER raw strings. This is critical for graph connectivity:\n"
+#     "    - ANY noun phrase that can be considered an entity (e.g., 'kids', 'support', 'adoption agencies', 'teacher', 'New York', 'meeting', 'group') MUST be created as a separate node in the `entities` list first.\n"
+#     "    - Fact's `subject` field: MUST be a Person ID (e.g., 'person_caroline') or Entity ID (e.g., 'entity_kids'), NEVER a raw string like 'Caroline' or 'kids'.\n"
+#     "    - Fact's `object` field: MUST be an Entity ID (e.g., 'entity_adoption_agencies', 'entity_teacher', 'entity_new_york'), NEVER a raw string like 'adoption agencies' or 'teacher'.\n"
+#     "    - Exception: For simple values (emotions like 'happy', 'sad', numbers, dates), you can use the `value` field instead of `object`, and these don't need entity nodes.\n"
+#     "    - BAD: {\"subject\": \"person_caroline\", \"predicate\": \"has\", \"object\": \"kids\"}  # 'kids' is a raw string\n"
+#     "    - GOOD: Create entity {\"id\": \"entity_kids\", \"name\": \"kids\", \"type\": \"concept\"}, then {\"subject\": \"person_caroline\", \"predicate\": \"has\", \"object\": \"entity_kids\"}\n"
+#     "    - BAD: {\"subject\": \"person_caroline\", \"predicate\": \"researches\", \"object\": \"adoption agencies\"}  # 'adoption agencies' is a raw string\n"
+#     "    - GOOD: Create entity {\"id\": \"entity_adoption_agencies\", \"name\": \"adoption agencies\", \"type\": \"topic\"}, then {\"subject\": \"person_caroline\", \"predicate\": \"researches\", \"object\": \"entity_adoption_agencies\"}\n"
+#     "</critical_rules>\n\n"
+#     "<example>\n"
+#     "This example demonstrates exactly how to process input text into the desired JSON output.\n\n"
+#     "--- EXAMPLE INPUT TEXT 1 ---\n"
+#     "'Hey Mel! Last Tuesday I joined a new LGBTQ activist group. I also started researching adoption agencies.'\n\n"
+#     "--- EXAMPLE METADATA ---\n"
+#     "doc_id: 'convo_1_turn_5'\n"
+#     "session_id: 'session_1'\n"
+#     "turn_id: '5'\n"
+#     "question_date_iso: '2023-07-21T00:00:00' # This is a Friday\n\n"
+#     "--- EXAMPLE CORRECT OUTPUT (This is your target format) ---\n"
+#     '''
+#     {
+#       "nodes": {
+#         "persons": [
+#           {"id": "person_interlocutor", "canonical_name": "Caroline", "aliases": [], "persona_traits": ["motivated", "committed to family"], "profession": "counseling", "background": "transgender woman seeking to adopt", "evidence_span": "span_0"},
+#           {"id": "person_melanie", "canonical_name": "Mel", "aliases": ["Melanie"], "persona_traits": ["creative", "outdoorsy"], "profession": "artist", "background": "friend of Caroline", "evidence_span": "span_1"}
+#         ],
+#         "entities": [
+#           {"id": "entity_lgbtq_group", "name": "LGBTQ activist group", "type": "organization", "evidence_span": "span_2"},
+#           {"id": "entity_adoption_agencies", "name": "adoption agencies", "type": "topic", "evidence_span": "span_3"}
+#         ],
+#         "events": [
+#           {"id": "event_join_group", "title": "Joined LGBTQ activist group", "participants": ["person_interlocutor"], "time_start": "2023-07-18T00:00:00", "evidence_span": "span_4"},
+#           {"id": "event_research", "title": "Researched adoption agencies", "participants": ["person_interlocutor"], "time_start": "2023-07-21T00:00:00", "evidence_span": "span_3"}
+#         ],
+#         "facts": [
+#           {"id": "fact_research_agencies", "subject": "person_interlocutor", "predicate": "researches", "object": "entity_adoption_agencies", "subtype": "action", "evidence_span": "span_3"}
+#         ],
+#         "evidence_spans": [
+#           {"id": "span_0", "source_text": "I"},
+#           {"id": "span_1", "source_text": "Mel"},
+#           {"id": "span_2", "source_text": "LGBTQ activist group"},
+#           {"id": "span_3", "source_text": "researching adoption agencies"},
+#           {"id": "span_4", "source_text": "joined a new LGBTQ activist group last Tues"}
+#         ]
+#       },
+#       "edges": {
+#         "involved_in": [
+#           {"source": "person_interlocutor", "target": "event_join_group"},
+#           {"source": "person_interlocutor", "target": "event_research"}
+#         ],
+#         "asserts": [
+#           {"source": "event_research", "target": "fact_research_agencies"}
+#         ]
+#       }
+#     }
+#     '''
+#     "\n\n"
+#     "--- EXAMPLE INPUT TEXT 2 (Demonstrating Event vs Fact Distinction in Conversational Data) ---\n"
+#     "'Caroline said: I went camping in June. I also attended the LGBTQ support group last week. I'm working as a teacher now and I've been living in New York for two years.'\n\n"
+#     "**CRITICAL FOR CONVERSATIONAL DATA**: Even though the text says 'Caroline said: I went camping', you MUST extract 'Caroline went camping' as an Event, NOT 'Caroline said' as a Fact.\n"
+#     "The actual action (went camping) is the Event. The speech act (said) is just the delivery mechanism, not the content.\n\n"
+#     "--- EXAMPLE CORRECT OUTPUT 2 ---\n"
+#     '''
+#     {
+#       "nodes": {
+#         "persons": [
+#           {"id": "person_speaker", "canonical_name": "Caroline", "aliases": [], "evidence_span": "span_0"}
+#         ],
+#         "entities": [
+#           {"id": "entity_meeting", "name": "meeting", "type": "event", "evidence_span": "span_1"},
+#           {"id": "entity_teacher", "name": "teacher", "type": "concept", "evidence_span": "span_3"},
+#           {"id": "entity_new_york", "name": "New York", "type": "location", "evidence_span": "span_4"},
+#           {"id": "entity_kids", "name": "kids", "type": "concept", "evidence_span": "span_5"},
+#           {"id": "entity_support_group", "name": "support group", "type": "organization", "evidence_span": "span_6"}
+#         ],
+#         "events": [
+#           {"id": "event_camping", "title": "Went camping", "participants": ["person_caroline"], "time_start": "2023-06-XX", "evidence_span": "span_1"},
+#           {"id": "event_support_group", "title": "Attended LGBTQ support group", "participants": ["person_caroline"], "time_start": "2023-07-14T00:00:00", "evidence_span": "span_2"}
+#         ],
+#         "facts": [
+#           {"id": "fact_works_as", "subject": "person_caroline", "predicate": "works_as", "object": "entity_teacher", "subtype": "trait", "evidence_span": "span_3"},
+#           {"id": "fact_lives_in", "subject": "person_caroline", "predicate": "lives_in", "object": "entity_new_york", "subtype": "location", "evidence_span": "span_4"}
+#         ],
+#         "evidence_spans": [
+#           {"id": "span_0", "source_text": "Caroline"},
+#           {"id": "span_1", "source_text": "went camping in June"},
+#           {"id": "span_2", "source_text": "attended the LGBTQ support group last week"},
+#           {"id": "span_3", "source_text": "working as a teacher"},
+#           {"id": "span_4", "source_text": "living in New York"}
+#         ]
+#       },
+#       "edges": {
+#         "involved_in": [
+#           {"source": "person_caroline", "target": "event_camping"},
+#           {"source": "person_caroline", "target": "event_support_group"}
+#         ],
+#         "asserts": []
+#       }
+#     }
+#     '''
+#     "</example>"
+# )
 STRUCTURED_EXTRACTION_SYSTEM = (
-     "<role>\n"
-    "You are a highly precise information extraction engine. Your task is to parse conversational text and convert it into a structured JSON knowledge graph. Adherence to a strict JSON format is critical.\n"
+    "<role>\n"
+    "You are a Graph Extraction Engine. Your job is to convert conversation text into a structured JSON knowledge graph.\n"
+    "**CRITICAL**: You MUST be EXTREMELY AGGRESSIVE in extracting PAST TENSE ACTIONS as 'events' and PRESENT TENSE STATES as 'facts'.\n"
     "</role>\n\n"
-    "<goal>\n"
-    "From the user's text, extract and structure all relevant information into `persons`, `events`, `facts`, and their relationships. Every piece of extracted information must be linked back to a specific text span as evidence.\n"
-    "</goal>\n\n"
-    "<critical_rules>\n"
-    "1.  **JSON Syntax Perfection**: Your output MUST be a perfectly valid JSON object. Pay extremely close attention to commas, brackets, and quotes. Do NOT use trailing commas. Ensure all strings are properly escaped.\n"
-    "2.  **No Fabrication**: Only extract information explicitly mentioned in the text.\n"
-    "3.  **Person-Centered Model**: Structure information hierarchically: Persons participate in Events, and Events assert Facts. This is a core requirement.\n"
-    "4.  **Traceability is Key**: Every single node (`persons`, `events`, `facts`) MUST have an `evidence_span` linking it back to the source text.\n"
-    "5.  **Rich Person Descriptions**: Person nodes MUST include comprehensive descriptive information:\n"
-    "    - `persona_traits`: Array of personality traits/characteristics (e.g., ['motivated', 'creative', 'compassionate'])\n"
-    "    - `profession`: Current job or career field (e.g., 'counseling', 'artist', 'teacher')\n"
-    "    - `background`: Key background information (e.g., 'transgender woman', 'recently moved', 'single parent')\n"
-    "    - `identity`: Important identity aspects (e.g., 'LGBTQ+', 'artist', 'activist')\n"
-    "    If information is not available in text, use empty arrays/strings, but always include these fields.\n"
-    "6.  **Handle Emptiness**: If the text contains no extractable information, you MUST return a valid JSON with empty arrays for all node types, like `{\"nodes\": {\"persons\": [], ...}, \"edges\": {}}`.\n"
-    "6.  **Atomic Facts Only**: Facts MUST be atomic and use simple, generic predicates. Break down complex descriptive predicates into atomic components:\n"
-    "    - BAD: predicate: 'was happy about', object: 'the meeting'\n"
-    "    - GOOD: predicate: 'feels', object: 'happy', subtype: 'feeling'\n"
-    "    - BAD: predicate: 'is working as a', object: 'teacher'\n"
-    "    - GOOD: predicate: 'works_as', object: 'teacher', subtype: 'trait'\n"
-    "    - BAD: predicate: 'has been living in', object: 'New York'\n"
-    "    - GOOD: predicate: 'lives_in', object: 'New York', subtype: 'location'\n"
-    "    Use atomic predicates like: 'is', 'has', 'feels', 'does', 'works_at', 'lives_in', 'knows', 'owns', 'likes', 'wants', etc.\n"
-    "    Always include a `subtype` field: 'trait' (permanent characteristics), 'action' (one-time or repeated actions), 'feeling' (emotions), 'state' (temporary conditions), 'relationship' (connections between entities), 'possession' (ownership), 'location' (where something is), or 'other'.\n"
-    "7.  **STRICT ID-ONLY REFERENCES**: Fact nodes MUST use entity IDs in subject/object fields, NEVER raw strings. This is critical for graph connectivity:\n"
-    "    - ANY noun phrase that can be considered an entity (e.g., 'kids', 'support', 'adoption agencies', 'teacher', 'New York', 'meeting', 'group') MUST be created as a separate node in the `entities` list first.\n"
-    "    - Fact's `subject` field: MUST be a Person ID (e.g., 'person_caroline') or Entity ID (e.g., 'entity_kids'), NEVER a raw string like 'Caroline' or 'kids'.\n"
-    "    - Fact's `object` field: MUST be an Entity ID (e.g., 'entity_adoption_agencies', 'entity_teacher', 'entity_new_york'), NEVER a raw string like 'adoption agencies' or 'teacher'.\n"
-    "    - Exception: For simple values (emotions like 'happy', 'sad', numbers, dates), you can use the `value` field instead of `object`, and these don't need entity nodes.\n"
-    "    - BAD: {\"subject\": \"person_caroline\", \"predicate\": \"has\", \"object\": \"kids\"}  # 'kids' is a raw string\n"
-    "    - GOOD: Create entity {\"id\": \"entity_kids\", \"name\": \"kids\", \"type\": \"concept\"}, then {\"subject\": \"person_caroline\", \"predicate\": \"has\", \"object\": \"entity_kids\"}\n"
-    "    - BAD: {\"subject\": \"person_caroline\", \"predicate\": \"researches\", \"object\": \"adoption agencies\"}  # 'adoption agencies' is a raw string\n"
-    "    - GOOD: Create entity {\"id\": \"entity_adoption_agencies\", \"name\": \"adoption agencies\", \"type\": \"topic\"}, then {\"subject\": \"person_caroline\", \"predicate\": \"researches\", \"object\": \"entity_adoption_agencies\"}\n"
-    "</critical_rules>\n\n"
-    "<example>\n"
-    "This example demonstrates exactly how to process input text into the desired JSON output.\n\n"
-    "--- EXAMPLE INPUT TEXT 1 ---\n"
-    "'Hey Mel! Last Tuesday I joined a new LGBTQ activist group. I also started researching adoption agencies.'\n\n"
-    "--- EXAMPLE METADATA ---\n"
-    "doc_id: 'convo_1_turn_5'\n"
-    "session_id: 'session_1'\n"
-    "turn_id: '5'\n"
-    "question_date_iso: '2023-07-21T00:00:00' # This is a Friday\n\n"
-    "--- EXAMPLE CORRECT OUTPUT (This is your target format) ---\n"
-    '''
-    {
-      "nodes": {
-        "persons": [
-          {"id": "person_interlocutor", "canonical_name": "Caroline", "aliases": [], "persona_traits": ["motivated", "committed to family"], "profession": "counseling", "background": "transgender woman seeking to adopt", "evidence_span": "span_0"},
-          {"id": "person_melanie", "canonical_name": "Mel", "aliases": ["Melanie"], "persona_traits": ["creative", "outdoorsy"], "profession": "artist", "background": "friend of Caroline", "evidence_span": "span_1"}
-        ],
-        "entities": [
-          {"id": "entity_lgbtq_group", "name": "LGBTQ activist group", "type": "organization", "evidence_span": "span_2"},
-          {"id": "entity_adoption_agencies", "name": "adoption agencies", "type": "topic", "evidence_span": "span_3"}
-        ],
-        "events": [
-          {"id": "event_join_group", "title": "Joined LGBTQ activist group", "participants": ["person_interlocutor"], "time_start": "2023-07-18T00:00:00", "evidence_span": "span_4"},
-          {"id": "event_research", "title": "Researched adoption agencies", "participants": ["person_interlocutor"], "time_start": "2023-07-21T00:00:00", "evidence_span": "span_3"}
-        ],
-        "facts": [
-          {"id": "fact_research_agencies", "subject": "person_interlocutor", "predicate": "researches", "object": "entity_adoption_agencies", "subtype": "action", "evidence_span": "span_3"}
-        ],
-        "evidence_spans": [
-          {"id": "span_0", "source_text": "I"},
-          {"id": "span_1", "source_text": "Mel"},
-          {"id": "span_2", "source_text": "LGBTQ activist group"},
-          {"id": "span_3", "source_text": "researching adoption agencies"},
-          {"id": "span_4", "source_text": "joined a new LGBTQ activist group last Tues"}
-        ]
-      },
-      "edges": {
-        "involved_in": [
-          {"source": "person_interlocutor", "target": "event_join_group"},
-          {"source": "person_interlocutor", "target": "event_research"}
-        ],
-        "asserts": [
-          {"source": "event_research", "target": "fact_research_agencies"}
-        ]
-      }
-    }
-    '''
-    "\n\n"
-    "--- EXAMPLE INPUT TEXT 2 (Demonstrating Atomic Facts and ID-Only References) ---\n"
-    "'I was really happy about the meeting yesterday. I'm working as a teacher now and I've been living in New York for two years. I have three kids and I love my support group.'\n\n"
-    "--- EXAMPLE CORRECT OUTPUT 2 ---\n"
-    '''
-    {
-      "nodes": {
-        "persons": [
-          {"id": "person_speaker", "canonical_name": "Caroline", "aliases": [], "evidence_span": "span_0"}
-        ],
-        "entities": [
-          {"id": "entity_meeting", "name": "meeting", "type": "event", "evidence_span": "span_1"},
-          {"id": "entity_teacher", "name": "teacher", "type": "concept", "evidence_span": "span_3"},
-          {"id": "entity_new_york", "name": "New York", "type": "location", "evidence_span": "span_4"},
-          {"id": "entity_kids", "name": "kids", "type": "concept", "evidence_span": "span_5"},
-          {"id": "entity_support_group", "name": "support group", "type": "organization", "evidence_span": "span_6"}
-        ],
-        "events": [
-          {"id": "event_meeting", "title": "Attended meeting", "participants": ["person_speaker"], "time_start": "2023-07-20T00:00:00", "evidence_span": "span_1"}
-        ],
-        "facts": [
-          {"id": "fact_feels_happy", "subject": "person_speaker", "predicate": "feels", "value": "happy", "subtype": "feeling", "evidence_span": "span_2"},
-          {"id": "fact_works_as", "subject": "person_speaker", "predicate": "works_as", "object": "entity_teacher", "subtype": "trait", "evidence_span": "span_3"},
-          {"id": "fact_lives_in", "subject": "person_speaker", "predicate": "lives_in", "object": "entity_new_york", "subtype": "location", "evidence_span": "span_4"},
-          {"id": "fact_has_kids", "subject": "person_speaker", "predicate": "has", "object": "entity_kids", "value": 3, "subtype": "possession", "evidence_span": "span_5"},
-          {"id": "fact_loves", "subject": "person_speaker", "predicate": "loves", "object": "entity_support_group", "subtype": "feeling", "evidence_span": "span_6"}
-        ],
-        "evidence_spans": [
-          {"id": "span_0", "source_text": "I"},
-          {"id": "span_1", "source_text": "the meeting yesterday"},
-          {"id": "span_2", "source_text": "was really happy about"},
-          {"id": "span_3", "source_text": "working as a teacher"},
-          {"id": "span_4", "source_text": "living in New York"},
-          {"id": "span_5", "source_text": "three kids"},
-          {"id": "span_6", "source_text": "support group"}
-        ]
-      },
-      "edges": {
-        "involved_in": [
-          {"source": "person_speaker", "target": "event_meeting"}
-        ],
-        "asserts": [
-          {"source": "event_meeting", "target": "fact_feels_happy"}
-        ]
-      }
-    }
-    '''
-    "</example>"
+    "<⚠️ MANDATORY FIRST STEP>\n"
+    "BEFORE extracting anything, scan the text for ALL past tense action verbs:\n"
+    "- went, attended, joined, visited, participated, volunteered, met, saw, helped, started, finished, completed, researched, organized, created, ran, walked, drove, painted, wrote, read, cooked, ate, slept, woke, left, arrived, returned, and ANY other past tense verb\n"
+    "- For EACH past tense action verb found, you MUST create an EVENT node\n"
+    "- DO NOT extract past tense actions as Facts\n"
+    "</⚠️ MANDATORY FIRST STEP>\n\n"
+    "<extraction_rules>\n"
+    "1. **PERSONS**: Extract the speaker (usually 'I') and any mentioned names.\n"
+    "2. **EVENTS (Dynamic - PAST TENSE ACTIONS)**: Extract ANY past tense verb phrase describing an action.\n"
+    "   - **CRITICAL RULE**: If the text contains a PAST TENSE ACTION VERB, it MUST be an EVENT, NOT a Fact.\n"
+    "   - **Past Tense Examples**: 'went', 'attended', 'joined', 'visited', 'participated', 'volunteered', 'met', 'saw', 'helped', 'started', 'finished', 'researched', 'organized', 'created', 'ran', 'walked', 'drove', 'painted', 'wrote', 'read', 'cooked', 'ate', 'slept', 'woke', 'left', 'arrived', 'returned'\n"
+    "   - **Dialogue Handling**: If text says 'Caroline said: I went camping', extract 'Went camping' as an EVENT with participant 'Caroline'. IGNORE 'said' completely.\n"
+    "   - **Time**: Estimate the date based on context. If vague (e.g., 'in June'), use 'YYYY-MM-XX'. If 'yesterday', 'last week', etc., calculate from session date.\n"
+    "   - **Title Format**: Use past tense action summary, e.g., 'Went camping', 'Joined group', 'Attended meeting', 'Started researching'\n"
+    "3. **FACTS (Static - PRESENT TENSE STATES)**: Extract attributes, traits, preferences, relationships, and possessions.\n"
+    "   - **CRITICAL RULE**: Only extract as Fact if it describes WHAT someone IS or HAS (present tense states).\n"
+    "   - **Present Tense Examples**: 'is', 'has', 'likes', 'loves', 'works_as', 'lives_in', 'feels', 'enjoys', 'wants', 'needs', 'knows', 'owns'\n"
+    "   - **Examples**: 'is a teacher', 'likes hiking', 'lives in NY', 'has kids', 'feels happy'\n"
+    "   - **DO NOT extract past tense actions as Facts**\n"
+    "4. **ENTITIES**: Extract key nouns (places, organizations, concepts) referenced in Events or Facts.\n"
+    "</extraction_rules>\n\n"
+    "<json_schema>\n"
+    "You MUST return a JSON object with this exact structure:\n"
+    "{\n"
+    "  \"nodes\": {\n"
+    "    \"persons\": [{\"id\": \"string\", \"canonical_name\": \"string\"}],\n"
+    "    \"entities\": [{\"id\": \"string\", \"name\": \"string\", \"type\": \"string\"}],\n"
+    "    \"events\": [\n"
+    "      {\n"
+    "        \"id\": \"string (required, e.g., 'event_1')\",\n"
+    "        \"title\": \"string (REQUIRED - short action summary in past tense, e.g., 'Went camping', 'Joined group', 'Attended meeting')\",\n"
+    "        \"participants\": [\"string (REQUIRED - at least one person_id, e.g., ['person_caroline'])\"],\n"
+    "        \"time_start\": \"string (optional - ISO date like '2023-06-XX' or '2023-06-15')\",\n"
+    "        \"location\": \"string (optional)\"\n"
+    "      }\n"
+    "    ],\n"
+    "    \"facts\": [\n"
+    "      {\n"
+    "        \"id\": \"string\",\n"
+    "        \"subject\": \"string (node_id)\",\n"
+    "        \"predicate\": \"string (simple verb)\",\n"
+    "        \"object\": \"string (node_id or value)\",\n"
+    "        \"subtype\": \"trait|preference|relationship|possession|location\"\n"
+    "      }\n"
+    "    ],\n"
+    "    \"evidence_spans\": []\n"
+    "  },\n"
+    "  \"edges\": {}\n"
+    "}\n"
+    "</json_schema>\n\n"
+    "<⚠️ CRITICAL: Event Requirements>\n"
+    "- Every Event MUST have a 'title' field (non-empty string)\n"
+    "- Every Event MUST have a 'participants' array with at least one person_id\n"
+    "- If you find a past tense action verb, you MUST create an Event with these fields\n"
+    "- DO NOT create Events without title or participants\n"
+    "</⚠️ CRITICAL>\n\n"
+    "<examples>\n"
+    "Example 1: Past tense action → EVENT\n"
+    "Input: 'Yesterday, I joined the hiking club.' (Session Date: 2023-05-15)\n"
+    "Output:\n"
+    "{\n"
+    "  \"nodes\": {\n"
+    "    \"persons\": [{\"id\": \"person_speaker\", \"canonical_name\": \"Speaker\"}],\n"
+    "    \"entities\": [{\"id\": \"entity_hiking_club\", \"name\": \"hiking club\", \"type\": \"organization\"}],\n"
+    "    \"events\": [\n"
+    "      {\n"
+    "        \"id\": \"event_join_club\",\n"
+    "        \"title\": \"Joined hiking club\",\n"
+    "        \"participants\": [\"person_speaker\"],\n"
+    "        \"time_start\": \"2023-05-14\"\n"
+    "      }\n"
+    "    ],\n"
+    "    \"facts\": [],\n"
+    "    \"evidence_spans\": []\n"
+    "  },\n"
+    "  \"edges\": {}\n"
+    "}\n\n"
+    "Example 2: Dialogue format → Extract action as EVENT, ignore 'said'\n"
+    "Input: 'Caroline said: I went camping in June.' (Session Date: 2023-07-15)\n"
+    "Output:\n"
+    "{\n"
+    "  \"nodes\": {\n"
+    "    \"persons\": [{\"id\": \"person_caroline\", \"canonical_name\": \"Caroline\"}],\n"
+    "    \"entities\": [],\n"
+    "    \"events\": [\n"
+    "      {\n"
+    "        \"id\": \"event_camping\",\n"
+    "        \"title\": \"Went camping\",\n"
+    "        \"participants\": [\"person_caroline\"],\n"
+    "        \"time_start\": \"2023-06-XX\"\n"
+    "      }\n"
+    "    ],\n"
+    "    \"facts\": [],\n"
+    "    \"evidence_spans\": []\n"
+    "  },\n"
+    "  \"edges\": {}\n"
+    "}\n\n"
+    "Example 3: Present tense state → FACT\n"
+    "Input: 'I am a teacher. I like hiking.'\n"
+    "Output:\n"
+    "{\n"
+    "  \"nodes\": {\n"
+    "    \"persons\": [{\"id\": \"person_speaker\", \"canonical_name\": \"Speaker\"}],\n"
+    "    \"entities\": [\n"
+    "      {\"id\": \"entity_teacher\", \"name\": \"teacher\", \"type\": \"concept\"},\n"
+    "      {\"id\": \"entity_hiking\", \"name\": \"hiking\", \"type\": \"activity\"}\n"
+    "    ],\n"
+    "    \"events\": [],\n"
+    "    \"facts\": [\n"
+    "      {\"id\": \"fact_works_as\", \"subject\": \"person_speaker\", \"predicate\": \"works_as\", \"object\": \"entity_teacher\", \"subtype\": \"trait\"},\n"
+    "      {\"id\": \"fact_likes\", \"subject\": \"person_speaker\", \"predicate\": \"likes\", \"object\": \"entity_hiking\", \"subtype\": \"preference\"}\n"
+    "    ],\n"
+    "    \"evidence_spans\": []\n"
+    "  },\n"
+    "  \"edges\": {}\n"
+    "}\n"
+    "</examples>"
 )
 
 STRUCTURED_EXTRACTION_USER = (
-   "<task>\n"
-    "Based on the rules and the detailed example I provided, process the following INPUT TEXT and METADATA. Generate ONLY the final JSON output and nothing else.\n"
-    "</task>\n\n"
-    "--- INPUT TEXT ---\n"
-    "{INPUT_TEXT}\n\n"
-    "--- METADATA ---\n"
-    "doc_id: \"{DOC_ID}\"\n"
-    "session_id: \"{SESSION_ID}\"\n"
-    "turn_id: \"{TURN_ID}\"\n"
-    "question_date_iso: \"{QUESTION_DATE_ISO}\"\n\n"
-    "--- JSON OUTPUT ---"
+    "<⚠️ REMINDER: EXTRACTION CHECKLIST>\n"
+    "1. Scan the text for ALL past tense action verbs (went, attended, joined, visited, participated, volunteered, met, saw, helped, started, finished, researched, organized, created, ran, walked, drove, painted, wrote, read, cooked, ate, slept, woke, left, arrived, returned, etc.)\n"
+    "2. For EACH past tense action verb found, create an EVENT node (NOT a Fact node)\n"
+    "3. Extract present tense states, traits, and preferences (is, has, likes, works_as, lives_in, feels, etc.) as FACT nodes\n"
+    "4. If you see dialogue like 'X said: I did Y', extract 'X did Y' as an EVENT, ignore 'X said'\n"
+    "</⚠️ REMINDER>\n\n"
+    "Input Text: {INPUT_TEXT}\n"
+    "Context Metadata:\n"
+    "- Session Date: {QUESTION_DATE_ISO}\n"
+    "- Speaker/Subject: Determine from context\n\n"
+    "Extract all Events (past tense actions) and Facts (present tense states) into the required JSON format."
 )
+# STRUCTURED_EXTRACTION_USER = (
+#    "<task>\n"
+#     "Based on the rules and the detailed example I provided, process the following INPUT TEXT and METADATA. Generate ONLY the final JSON output and nothing else.\n"
+#     "</task>\n\n"
+#     "--- INPUT TEXT ---\n"
+#     "{INPUT_TEXT}\n\n"
+#     "--- METADATA ---\n"
+#     "doc_id: \"{DOC_ID}\"\n"
+#     "session_id: \"{SESSION_ID}\"\n"
+#     "turn_id: \"{TURN_ID}\"\n"
+#     "question_date_iso: \"{QUESTION_DATE_ISO}\"\n\n"
+#     "--- JSON OUTPUT ---"
+# )
 
 # ============================================================================
 # Phase 4: Simplified Answer Generation (Dare to Infer)

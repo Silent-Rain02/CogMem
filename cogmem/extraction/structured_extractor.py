@@ -92,18 +92,38 @@ class StructuredExtractor:
         nodes = data.get("nodes", {})
         edges = data.get("edges", {})
         
+        # 调试：打印原始提取结果
+        import os
+        if os.getenv("DEBUG_EXTRACTION", "").lower() in ("1", "true", "yes"):
+            print(f"\n[DEBUG] 原始提取结果:")
+            print(f"  Events (raw): {nodes.get('events', [])}")
+            print(f"  Facts (raw): {nodes.get('facts', [])}")
+        
         # 先解析 evidence_spans，用于后续解析其他节点时查找
         evidence_spans_list = self._parse_evidence_spans(nodes.get("evidence_spans", []), turn_id)
         # 创建 evidence_span ID 到详细信息的映射
         evidence_span_map = {span.id: span for span in evidence_spans_list}
         
+        # 解析所有节点
+        persons = self._parse_persons(nodes.get("persons", []), session_id, turn_id, evidence_span_map)
+        entities = self._parse_entities(nodes.get("entities", []), session_id, turn_id, evidence_span_map)
+        events = self._parse_events(nodes.get("events", []), session_id, turn_id, question_date_iso, evidence_span_map)
+        facts = self._parse_facts(nodes.get("facts", []), session_id, turn_id, question_date_iso, evidence_span_map)
+        preferences = self._parse_preferences(nodes.get("preferences", []), session_id, turn_id, question_date_iso, evidence_span_map)
+        
+        # 调试：打印解析后的结果
+        if os.getenv("DEBUG_EXTRACTION", "").lower() in ("1", "true", "yes"):
+            print(f"\n[DEBUG] 解析后结果:")
+            print(f"  Events (parsed): {len(events)}")
+            print(f"  Facts (parsed): {len(facts)}")
+        
         result = {
             "nodes": {
-                "persons": self._parse_persons(nodes.get("persons", []), session_id, turn_id, evidence_span_map),
-                "entities": self._parse_entities(nodes.get("entities", []), session_id, turn_id, evidence_span_map),
-                "events": self._parse_events(nodes.get("events", []), session_id, turn_id, question_date_iso, evidence_span_map),
-                "facts": self._parse_facts(nodes.get("facts", []), session_id, turn_id, question_date_iso, evidence_span_map),
-                "preferences": self._parse_preferences(nodes.get("preferences", []), session_id, turn_id, question_date_iso, evidence_span_map),
+                "persons": persons,
+                "entities": entities,
+                "events": events,
+                "facts": facts,
+                "preferences": preferences,
                 "evidence_spans": evidence_spans_list,
                 "time_normalizations": self._parse_time_normalizations(
                     nodes.get("time_normalizations", []),
@@ -248,28 +268,61 @@ class StructuredExtractor:
                 elif isinstance(evidence_span, dict):
                     evidence_span_dict = evidence_span
                 
-                event = Event(
-                    id=item.get("id", f"event_{uuid.uuid4().hex[:12]}"),
-                    title=item.get("title", ""),
-                    participants=item.get("participants", []),
-                    location=item.get("location"),
-                    time_start=item.get("time_start"),
-                    time_end=item.get("time_end"),
-                    granularity=item.get("granularity"),
-                    time_confidence=float(item.get("time_confidence", 1.0)),
-                    temporal_conflict=bool(item.get("temporal_conflict", False)),
-                    evidence_span=evidence_span_dict,
-                    source_session_id=item.get("source_session_id", session_id),
-                    source_turn_id=item.get("source_turn_id", turn_id),
-                    metadata=Metadata(
+                # 确保 title 不为空（必需字段）
+                title = item.get("title", "").strip()
+                if not title:
+                    # 如果没有 title，尝试从其他字段构建
+                    title = item.get("summary", "") or "Event"
+                
+                # 确保 participants 不为空（至少需要一个参与者）
+                participants = item.get("participants", [])
+                if not participants:
+                    # 如果没有参与者，尝试从 subject 或其他字段获取
+                    participant = item.get("subject") or item.get("participant")
+                    if participant:
+                        participants = [participant]
+                    else:
+                        # 如果没有参与者，使用默认值
+                        participants = ["person_speaker"]
+                
+                # 构建 Event 数据，明确排除 timestamp 字段（它是计算属性）
+                event_data = {
+                    "id": item.get("id", f"event_{uuid.uuid4().hex[:12]}"),
+                    "title": title,
+                    "participants": participants,
+                    "location": item.get("location"),
+                    "time_start": item.get("time_start"),
+                    "time_end": item.get("time_end"),
+                    "granularity": item.get("granularity"),
+                    "time_confidence": float(item.get("time_confidence", 1.0)),
+                    "temporal_conflict": bool(item.get("temporal_conflict", False)),
+                    "evidence_span": evidence_span_dict,
+                    "source_session_id": item.get("source_session_id", session_id),
+                    "source_turn_id": item.get("source_turn_id", turn_id),
+                    "content": item.get("content", ""),  # BaseNode 字段
+                    "topic_id": item.get("topic_id"),  # BaseNode 字段
+                    "is_archived": bool(item.get("is_archived", False)),  # BaseNode 字段
+                    "metadata": Metadata(
                         source=evidence_span_dict.get("text", "") if evidence_span_dict else "",
                         created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         source_session_id=item.get("source_session_id", session_id),
                         source_turn_id=item.get("source_turn_id", turn_id)
                     )
-                )
+                }
+                # 确保不包含 timestamp 字段
+                if "timestamp" in event_data:
+                    del event_data["timestamp"]
+                
+                event = Event(**event_data)
                 events.append(event)
-            except Exception:
+            except Exception as e:
+                # 添加调试输出，不要静默失败
+                import os
+                if os.getenv("DEBUG_EXTRACTION", "").lower() in ("1", "true", "yes") or os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
+                    print(f"⚠️ Event解析失败: {str(e)}")
+                    print(f"   Item: {item}")
+                    import traceback
+                    traceback.print_exc()
                 continue
         return events
     
