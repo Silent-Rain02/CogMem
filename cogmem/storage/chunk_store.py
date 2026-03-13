@@ -7,14 +7,12 @@ from typing import List, Tuple
 import faiss  # type: ignore
 import numpy as np
 
-
 @dataclass
 class Chunk:
     id: str
     text: str
     doc_id: str
     turn_id: str | None = None
-
 
 class ChunkStore:
     """文档片段的向量索引，用于直接检索包含答案的原文片段"""
@@ -87,4 +85,3 @@ class ChunkStore:
 
     def size(self) -> int:
         return len(self._chunks)
-

@@ -1,0 +1,12 @@
+{
+  "dim": 1024,
+  "metric": "cosine",
+  "type_counts": {},
+  "supported_types": [
+    "event",
+    "fact",
+    "person",
+    "concept",
+    "claim"
+  ]
+}

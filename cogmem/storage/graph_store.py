@@ -9,9 +9,8 @@ from datetime import datetime
 import networkx as nx
 
 from .schema import (
-    BaseNode, NodeTypeEnum, Entity, Relation, Person, Event, Fact, Preference, PersonFacet
+    BaseNode, NodeTypeEnum, Concept, Relation, Person, Event, Fact, Claim
 )
-
 
 class GraphStore:
     def __init__(self) -> None:
@@ -22,16 +21,27 @@ class GraphStore:
         self._id_to_node_index: Dict[str, Any] = {}  # node_id -> node_data (cached node data)
         self._index_dirty = True  # Flag to rebuild indexes when needed
 
-    def add_entities(self, entities: Iterable[Entity]) -> None:
-        """Add entities to the graph (deprecated, use add_nodes instead)"""
-        for e in entities:
-            entity_data = e.model_dump()
-            # Entity nodes use "type" field (preference/world), not node_type
-            # But we still add node_type for consistency
-            entity_data["node_type"] = NodeType.ENTITY.value
-            self._g.add_node(e.id, **entity_data)
-            self._update_indexes_on_add(e.id, e.name, entity_data)
-            self._changelog.append({"op": "upsert_entity", "id": e.id, "version": getattr(e, "version", 1)})
+    @property
+    def node_count(self) -> int:
+        """Return the number of nodes in the graph"""
+        return self._g.number_of_nodes()
+
+    @property
+    def edge_count(self) -> int:
+        """Return the number of edges in the graph"""
+        return self._g.number_of_edges()
+
+    def add_concepts(self, concepts: Iterable[Concept]) -> None:
+        """Add concepts to the graph
+        
+        Note: This method replaces add_entities(). Consider migrating to add_nodes().
+        """
+        for c in concepts:
+            concept_data = c.model_dump()
+            concept_data["node_type"] = NodeTypeEnum.CONCEPT.value
+            self._g.add_node(c.id, **concept_data)
+            self._update_indexes_on_add(c.id, c.name, concept_data)
+            self._changelog.append({"op": "upsert_concept", "id": c.id})
 
     def add_relations(self, relations: Iterable[Relation]) -> None:
         for r in relations:
@@ -44,157 +54,53 @@ class GraphStore:
                 "version": getattr(r, "version", 1),
             })
 
-    def get_entity(self, entity_id: str) -> Entity | None:
-        if entity_id in self._g:
-            data = self._g.nodes[entity_id]
+    def get_concept(self, concept_id: str) -> Concept | None:
+        """Get a Concept node by ID"""
+        if concept_id in self._g:
+            data = self._g.nodes[concept_id]
             try:
                 # Add id field (node_id is the key, not in data)
-                data_with_id = {**data, "id": entity_id}
-                node_type = data_with_id.get("node_type", "Entity")
-
-                # Handle different node types appropriately
-                if node_type == "Person":
-                    # Handle missing 'name' field for Person entities
-                    if "name" not in data_with_id and "canonical_name" in data_with_id:
-                        data_with_id["name"] = data_with_id["canonical_name"]
-                    # Set required Entity fields
-                    data_with_id["type"] = "world"
-                    data_with_id["subtype"] = "person"
-
-                    # Generate comprehensive description from all available info
-                    description_parts = []
-
-                    # Add persona traits
-                    if "persona_traits" in data_with_id and data_with_id["persona_traits"]:
-                        traits_str = ", ".join(data_with_id["persona_traits"])
-                        description_parts.append(f"Traits: {traits_str}")
-
-                    # Add aliases
-                    if "aliases" in data_with_id and data_with_id["aliases"]:
-                        aliases_str = ", ".join(data_with_id["aliases"])
-                        description_parts.append(f"Also known as: {aliases_str}")
-
-                    # Add role, profession, or other descriptive fields
-                    descriptive_fields = ["role", "profession", "occupation", "background", "identity"]
-                    for field in descriptive_fields:
-                        if field in data_with_id and data_with_id[field]:
-                            description_parts.append(f"{field.title()}: {data_with_id[field]}")
-
-                    # If no specific description available, create a meaningful generic description
-                    if not description_parts:
-                        person_name = data_with_id.get("name", "This person")
-                        description_parts.append(f"{person_name} is a person mentioned in conversations")
-
-                    data_with_id["description"] = "; ".join(description_parts)
-
-                    # Remove Person-specific fields that Entity doesn't have
-                    for key in ["canonical_name", "aliases", "persona_traits", "role", "profession", "occupation", "background", "identity"]:
-                        data_with_id.pop(key, None)
-                    return Entity(**data_with_id)
-
+                data_with_id = {**data, "id": concept_id}
+                node_type = data_with_id.get("node_type", "Concept")
+                
+                # Only handle Concept nodes
+                if node_type in ("Concept", "concept"):
+                    # Ensure required Concept fields
+                    if "name" not in data_with_id:
+                        data_with_id["name"] = data_with_id.get("id", "").replace("c_", "").replace("concept_", "")
+                    return Concept(**data_with_id)
+                
+                # For backward compatibility, try to convert other node types to Concept
+                # This is a temporary bridge during migration
+                if node_type in ("Person", "person"):
+                    # Convert Person to Concept representation
+                    name = data_with_id.get("canonical_name", data_with_id.get("name", concept_id))
+                    return Concept(
+                        id=concept_id,
+                        name=name.lower().replace(" ", "_"),
+                        aliases=data_with_id.get("aliases", []),
+                        description=f"Person: {name}",
+                        content=data_with_id.get("content", "")
+                    )
+                
                 elif node_type == "Event":
-                    # For events, create a pseudo-entity representation
-                    data_with_id["name"] = data_with_id.get("title", entity_id)
-                    data_with_id["type"] = "world"
-                    data_with_id["subtype"] = "event"
-
-                    # Generate comprehensive description from event details
-                    description_parts = []
-
-                    # Add time information
-                    if "time_start" in data_with_id and data_with_id["time_start"]:
-                        description_parts.append(f"Time: {data_with_id['time_start']}")
-
-                    # Add location information
-                    if "location" in data_with_id and data_with_id["location"]:
-                        description_parts.append(f"Location: {data_with_id['location']}")
-
-                    # Add participants information
-                    if "participants" in data_with_id and data_with_id["participants"]:
-                        participants_str = ", ".join(data_with_id["participants"][:3])  # Limit to first 3
-                        if len(data_with_id["participants"]) > 3:
-                            participants_str += f" and {len(data_with_id['participants']) - 3} others"
-                        description_parts.append(f"Participants: {participants_str}")
-
-                    # Add any other descriptive fields
-                    descriptive_fields = ["description", "notes", "category"]
-                    for field in descriptive_fields:
-                        if field in data_with_id and data_with_id[field]:
-                            description_parts.append(f"{field.title()}: {data_with_id[field]}")
-
-                    # If no specific description available, create a meaningful generic description
-                    if not description_parts:
-                        event_title = data_with_id.get("title", "This event")
-                        description_parts.append(f"{event_title} is an event mentioned in conversations")
-
-                    data_with_id["description"] = "; ".join(description_parts)
-
-                    # Remove Event-specific fields
-                    for key in ["title", "participants", "location", "time_start", "time_end", "granularity", "time_confidence", "temporal_conflict", "description", "notes", "category"]:
-                        data_with_id.pop(key, None)
-                    return Entity(**data_with_id)
-
-                elif node_type == "Fact":
-                    # For facts, create a pseudo-entity representation
-                    subject = data_with_id.get('subject', 'unknown')
-                    predicate = data_with_id.get('predicate', 'is')
-                    obj = data_with_id.get('object', 'unknown')
-
-                    # Create a more readable name
-                    if obj and obj != 'unknown':
-                        data_with_id["name"] = f"{subject} {predicate} {obj}"
-                    else:
-                        data_with_id["name"] = f"{subject} {predicate}"
-
-                    data_with_id["type"] = "world"
-                    data_with_id["subtype"] = "fact"
-
-                    # Generate informative description from fact details
-                    confidence = data_with_id.get('confidence', 1.0)
-                    description_parts = []
-
-                    # Add the core fact information
-                    if obj and obj != 'unknown':
-                        description_parts.append(f"Fact: {subject} {predicate} {obj}")
-                    else:
-                        description_parts.append(f"Fact: {subject} {predicate}")
-
-                    # Add confidence if not 1.0
-                    if confidence < 1.0:
-                        description_parts.append(f"(confidence: {confidence})")
-
-                    data_with_id["description"] = "; ".join(description_parts)
-
-                    # Remove Fact-specific fields
-                    for key in ["subject", "predicate", "object", "value", "valid_from", "valid_to", "confidence", "supersedes"]:
-                        data_with_id.pop(key, None)
-                    return Entity(**data_with_id)
-
-                elif node_type == "Preference":
-                    # For preferences, create a pseudo-entity representation
-                    data_with_id["name"] = f"{data_with_id.get('entity', 'someone')} {data_with_id.get('preference_type', 'prefers')} {data_with_id.get('aspect', '')}"
-                    data_with_id["type"] = "world"
-                    data_with_id["subtype"] = "preference"
-
-                    # Generate description from preference details
-                    entity = data_with_id.get('entity', 'someone')
-                    preference_type = data_with_id.get('preference_type', 'prefers')
-                    aspect = data_with_id.get('aspect', '')
-                    value = data_with_id.get('value', '')
-                    data_with_id["description"] = f"A preference indicating that {entity} {preference_type} {value} regarding {aspect}"
-
-                    # Remove Preference-specific fields
-                    for key in ["entity", "preference_type", "aspect", "value"]:
-                        data_with_id.pop(key, None)
-                    return Entity(**data_with_id)
-
-                else:
-                    # Default Entity handling
-                    if "type" not in data_with_id:
-                        data_with_id["type"] = "world"
-                    if "subtype" not in data_with_id:
-                        data_with_id["subtype"] = "entity"
-                    return Entity(**data_with_id)
+                    # Convert Event to Concept representation
+                    name = data_with_id.get("title", concept_id)
+                    return Concept(
+                        id=concept_id,
+                        name=name.lower().replace(" ", "_"),
+                        description=f"Event: {name}",
+                        content=data_with_id.get("content", "")
+                    )
+                
+                # Default: try to create Concept from any node
+                name = data_with_id.get("name", data_with_id.get("title", concept_id))
+                return Concept(
+                    id=concept_id,
+                    name=str(name).lower().replace(" ", "_"),
+                    description=data_with_id.get("description", ""),
+                    content=data_with_id.get("content", "")
+                )
             except Exception as e:
                 # Debug: print error in development
                 import os
@@ -238,7 +144,7 @@ class GraphStore:
                         # Remove Person-specific fields that Entity doesn't have
                         for key in ["canonical_name", "aliases", "persona_traits"]:
                             data_with_id.pop(key, None)
-                        return Entity(**data_with_id)
+                        return Concept(**data_with_id)
 
                     elif node_type == "Event":
                         # For events, create a pseudo-entity representation
@@ -273,7 +179,7 @@ class GraphStore:
                         # Remove Event-specific fields
                         for key in ["title", "participants", "location", "time_start", "time_end", "granularity", "time_confidence", "temporal_conflict"]:
                             data_with_id.pop(key, None)
-                        return Entity(**data_with_id)
+                        return Concept(**data_with_id)
 
                     elif node_type == "Fact":
                         # For facts, create a pseudo-entity representation
@@ -291,7 +197,7 @@ class GraphStore:
                         # Remove Fact-specific fields
                         for key in ["subject", "predicate", "object", "value", "valid_from", "valid_to", "confidence", "supersedes"]:
                             data_with_id.pop(key, None)
-                        return Entity(**data_with_id)
+                        return Concept(**data_with_id)
 
                     elif node_type == "Preference":
                         # For preferences, create a pseudo-entity representation
@@ -309,7 +215,7 @@ class GraphStore:
                         # Remove Preference-specific fields
                         for key in ["entity", "preference_type", "aspect", "value"]:
                             data_with_id.pop(key, None)
-                        return Entity(**data_with_id)
+                        return Concept(**data_with_id)
 
                     else:
                         # Default Entity handling
@@ -317,7 +223,7 @@ class GraphStore:
                             data_with_id["type"] = "world"
                         if "subtype" not in data_with_id:
                             data_with_id["subtype"] = "entity"
-                        return Entity(**data_with_id)
+                        return Concept(**data_with_id)
             except Exception as e:
                 if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
                     print(f"[GraphStore] Error parsing cached Entity {entity_id}: {e}")
@@ -334,6 +240,79 @@ class GraphStore:
         
         # Update id_to_node index
         self._id_to_node_index[node_id] = node_data
+    
+    def _update_indexes_on_remove(self, node_id: str) -> None:
+        """Update indexes when a node is removed"""
+        # Remove from id_to_node index
+        if node_id in self._id_to_node_index:
+            node_data = self._id_to_node_index.pop(node_id)
+            
+            # Remove from name_to_id index
+            # Need to find the name(s) associated with this node
+            node_type = node_data.get("node_type", "unknown") if node_data else "unknown"
+            name = None
+            
+            if node_type == "Person":
+                name = node_data.get("canonical_name") if node_data else None
+            elif node_type in ("Entity", "Concept", "concept"):
+                name = node_data.get("name") if node_data else None
+            elif node_type == "Event":
+                name = node_data.get("title") if node_data else None
+            elif node_type == "Preference":
+                name = node_data.get("subject") if node_data else None
+            else:
+                name = node_data.get("name") or node_data.get("canonical_name") if node_data else None
+            
+            if name and name in self._name_to_id_index:
+                if node_id in self._name_to_id_index[name]:
+                    self._name_to_id_index[name].remove(node_id)
+                # Clean up empty lists
+                if not self._name_to_id_index[name]:
+                    del self._name_to_id_index[name]
+    
+    def remove_node(self, node_id: str) -> None:
+        """Remove a node and all its edges from the graph
+        
+        Args:
+            node_id: ID of the node to remove
+        """
+        if node_id not in self._g:
+            return
+        
+        # Remove all edges connected to this node
+        # NetworkX will automatically remove edges when node is removed,
+        # but we need to update changelog first
+        in_edges = list(self._g.in_edges(node_id, data=True))
+        out_edges = list(self._g.out_edges(node_id, data=True))
+        
+        # Log edge removals
+        for src, _, data in in_edges:
+            self._changelog.append({
+                "op": "remove_relation",
+                "head": src,
+                "tail": node_id,
+                "rel_type": data.get("rel_type", "unknown")
+            })
+        
+        for _, dst, data in out_edges:
+            self._changelog.append({
+                "op": "remove_relation",
+                "head": node_id,
+                "tail": dst,
+                "rel_type": data.get("rel_type", "unknown")
+            })
+        
+        # Remove node from graph
+        self._g.remove_node(node_id)
+        
+        # Update indexes
+        self._update_indexes_on_remove(node_id)
+        
+        # Log node removal
+        self._changelog.append({
+            "op": "remove_node",
+            "id": node_id
+        })
     
     def _rebuild_indexes(self) -> None:
         """Rebuild all indexes from graph (call when loading from disk)"""
@@ -374,7 +353,7 @@ class GraphStore:
         
         self._index_dirty = False
     
-    def get_entity_by_name(self, name: str) -> Entity | None:
+    def get_entity_by_name(self, name: str) -> Concept | None:
         """通过实体名称查找实体（返回第一个匹配的）- 使用索引优化"""
         if self._index_dirty:
             self._rebuild_indexes()
@@ -389,19 +368,19 @@ class GraphStore:
                     data = self._id_to_node_index[entity_id]
                     try:
                         data_with_id = {**data, "id": entity_id}
-                        return Entity(**data_with_id)
+                        return Concept(**data_with_id)
                     except Exception:
                         pass
         
         # Fallback to old method (shouldn't happen if indexes are correct)
         return None
     
-    def get_entities_by_name(self, name: str) -> List[Entity]:
+    def get_entities_by_name(self, name: str) -> List[Concept]:
         """通过实体名称查找所有匹配的实体 - 使用索引优化"""
         if self._index_dirty:
             self._rebuild_indexes()
 
-        results: List[Entity] = []
+        results: List[Concept] = []
         # Use index for O(1) lookup
         if name in self._name_to_id_index:
             for entity_id in self._name_to_id_index[name]:
@@ -432,12 +411,12 @@ class GraphStore:
                             # 移除Person特有的字段
                             for key in ["canonical_name", "aliases", "persona_traits"]:
                                 entity_data.pop(key, None)
-                            results.append(Entity(**entity_data))
-                        elif node_type == "Entity":
+                            results.append(Concept(**entity_data))
+                        elif node_type in ("Concept", "concept", "Entity", "entity"):
                             # Entity节点直接使用
                             entity_data = data.copy()
                             entity_data["id"] = entity_id
-                            results.append(Entity(**entity_data))
+                            results.append(Concept(**entity_data))
                         elif node_type == "Event":
                             # Event节点使用title作为name
                             entity_data = data.copy()
@@ -473,7 +452,7 @@ class GraphStore:
                             # 移除Event特有的字段
                             for key in ["title", "participants", "location", "time_start", "time_end", "granularity", "time_confidence", "temporal_conflict"]:
                                 entity_data.pop(key, None)
-                            results.append(Entity(**entity_data))
+                            results.append(Concept(**entity_data))
                         elif node_type == "Preference":
                             # Preference节点使用subject作为name（如果有的话）
                             if "subject" in data:
@@ -493,13 +472,13 @@ class GraphStore:
                                 # 移除Preference特有的字段
                                 for key in ["entity", "preference_type", "aspect", "value", "subject", "predicate", "object", "confidence", "evidence_span"]:
                                     entity_data.pop(key, None)
-                                results.append(Entity(**entity_data))
+                                results.append(Concept(**entity_data))
                         # Fact和其他类型跳过
                     except Exception:
                         pass
         return results
 
-    def iter_entities(self) -> Iterable[Entity]:
+    def iter_entities(self) -> Iterable[Concept]:
         """迭代所有实体，跳过无效节点"""
         for node_id, data in self._g.nodes(data=True):
             # 节点ID就是实体ID，检查数据是否存在
@@ -547,12 +526,12 @@ class GraphStore:
                     # 移除Person特有的字段，避免Entity验证失败
                     for key in ["canonical_name", "aliases", "persona_traits", "role", "profession", "occupation", "background", "identity"]:
                         entity_data.pop(key, None)
-                    yield Entity(**entity_data)
+                    yield Concept(**entity_data)
                 elif node_type == "Entity":
                     # Entity节点直接使用，确保id字段存在
                     entity_data = data.copy()
                     entity_data["id"] = node_id
-                    yield Entity(**entity_data)
+                    yield Concept(**entity_data)
                 elif node_type == "Event":
                     # Event节点使用title作为name
                     entity_data = data.copy()
@@ -588,7 +567,7 @@ class GraphStore:
                     # 移除Event特有的字段
                     for key in ["title", "participants", "location", "time_start", "time_end", "granularity", "time_confidence", "temporal_conflict"]:
                         entity_data.pop(key, None)
-                    yield Entity(**entity_data)
+                    yield Concept(**entity_data)
                 elif node_type == "Fact":
                     # Fact节点跳过（不是实体）
                     continue
@@ -603,16 +582,16 @@ class GraphStore:
                         # 移除Preference特有的字段
                         for key in ["subject", "predicate", "object", "confidence", "evidence_span"]:
                             entity_data.pop(key, None)
-                        yield Entity(**entity_data)
+                        yield Concept(**entity_data)
                 # 其他类型跳过
             except Exception as e:
                 # 跳过无法解析的节点
                 continue
 
     # --- 查询工具 ---
-    def neighbors(self, entity_id: str, rel_type: Optional[str] = None, direction: str = "out", min_weight: Optional[float] = None, min_confidence: Optional[float] = None) -> List[Entity]:
+    def neighbors(self, entity_id: str, rel_type: Optional[str] = None, direction: str = "out", min_weight: Optional[float] = None, min_confidence: Optional[float] = None) -> List[Concept]:
         """获取邻居实体，支持按关系类型、权重、置信度过滤"""
-        results: List[Entity] = []
+        results: List[Concept] = []
         if direction == "out":
             edges = self._g.out_edges(entity_id, keys=True, data=True)
         elif direction == "in":
@@ -628,7 +607,7 @@ class GraphStore:
                 continue
             nid = v if u == entity_id else u
             if nid in self._g:
-                results.append(Entity(**self._g.nodes[nid]))
+                results.append(Concept(**self._g.nodes[nid]))
         return results
 
     def k_hop_subgraph(self, start_ids: List[str], k: int = 2) -> nx.MultiDiGraph:
@@ -762,7 +741,7 @@ class GraphStore:
     
     # --- Multi-type node support ---
     
-    def add_node(self, node: Union[BaseNode, Entity, Person, Event, Fact, Preference, PersonFacet]) -> None:
+    def add_node(self, node: Union[BaseNode, Entity, Person, Event, Fact, Claim]) -> None:
         """Add any type of node to the graph with type-safe NodeType metadata
 
         Args:
@@ -776,20 +755,18 @@ class GraphStore:
 
         # Use NodeTypeEnum for standardization (fallback to class name if not found)
         try:
-            # For Entity nodes, we need to check the actual subtype
-            if isinstance(node, Entity):
-                node_type = NodeTypeEnum.ENTITY.value
+            # For Concept nodes, we need to check the actual subtype
+            if isinstance(node, Concept):
+                node_type = NodeTypeEnum.CONCEPT.value
             elif isinstance(node, Person):
                 node_type = NodeTypeEnum.PERSON.value
             elif isinstance(node, Event):
                 node_type = NodeTypeEnum.EVENT.value
             elif isinstance(node, Fact):
                 node_type = NodeTypeEnum.FACT.value
-            elif isinstance(node, Preference):
-                node_type = NodeTypeEnum.PREFERENCE.value
             else:
                 # Fallback: try to map class name to NodeTypeEnum
-                node_type = getattr(NodeTypeEnum, node_type_class.upper(), NodeTypeEnum.ENTITY).value
+                node_type = getattr(NodeTypeEnum, node_type_class.upper(), NodeTypeEnum.CONCEPT).value
         except AttributeError:
             node_type = node_type_class.lower()
 
@@ -799,35 +776,59 @@ class GraphStore:
         # Update indexes based on node type
         if isinstance(node, Person) and hasattr(node, "canonical_name"):
             self._update_indexes_on_add(node_id, node.canonical_name, node_data)
-        elif isinstance(node, Entity) and hasattr(node, "name"):
+        elif isinstance(node, Concept) and hasattr(node, "name"):
             self._update_indexes_on_add(node_id, node.name, node_data)
         elif isinstance(node, Event) and hasattr(node, "title"):
             # Event nodes use title as name for indexing
             self._update_indexes_on_add(node_id, node.title, node_data)
-        elif isinstance(node, Preference) and hasattr(node, "holder"):
-            # Preference nodes use holder (person ID) for indexing
-            self._update_indexes_on_add(node_id, str(node.holder), node_data)
         else:
             # For other node types (Fact, etc.), just cache the node data
             self._id_to_node_index[node_id] = node_data
 
         self._changelog.append({"op": f"upsert_{node_type}", "id": node_id})
     
-    def add_nodes(self, nodes: Iterable[Union[Entity, Person, Event, Fact, Preference, PersonFacet]]) -> None:
+    def add_nodes(self, nodes: Iterable[Union[Entity, Person, Event, Fact, Claim]]) -> None:
         """Add multiple nodes of any type"""
         for node in nodes:
             self.add_node(node)
     
     def get_node(self, node_id: str, node_type: Optional[Union[NodeType, str]] = None) -> Optional[Dict[str, Any]]:
-        """Get node by ID, optionally filtering by NodeType enum"""
+        """Get node by ID, optionally filtering by NodeType enum
+        
+        ROOT FIX: 确保返回的数据总是包含 node_type 字段，如果没有则从节点ID推断
+        这保证了数据模型的一致性，避免了字段命名不一致的问题
+        """
         if node_id not in self._g:
             return None
         data = self._g.nodes[node_id]
+        
+        # ROOT FIX: 确保 node_type 字段存在，如果没有则从ID推断
+        node_data = dict(data)
+        if "node_type" not in node_data or not node_data.get("node_type"):
+            # 从节点ID前缀推断类型（优雅降级）
+            if node_id.startswith("p_") or node_id.startswith("person_"):
+                node_data["node_type"] = NodeTypeEnum.PERSON.value
+            elif node_id.startswith("c_") or node_id.startswith("concept_"):
+                node_data["node_type"] = NodeTypeEnum.CONCEPT.value
+            elif node_id.startswith("event_"):
+                node_data["node_type"] = NodeTypeEnum.EVENT.value
+            elif node_id.startswith("fact_"):
+                node_data["node_type"] = NodeTypeEnum.FACT.value
+            elif node_id.startswith("claim_"):
+                node_data["node_type"] = NodeTypeEnum.CLAIM.value
+            else:
+                # 如果无法推断，使用已有的值或默认值
+                node_data["node_type"] = node_data.get("node_type", "unknown")
+        
+        # 确保 id 字段存在（节点ID是图的key，不在数据中）
+        if "id" not in node_data:
+            node_data["id"] = node_id
+        
         if node_type:
             expected_type = node_type.value if isinstance(node_type, NodeType) else node_type
-            if data.get("node_type") != expected_type:
+            if node_data.get("node_type") != expected_type:
                 return None
-        return dict(data)
+        return node_data
     
     def get_person(self, person_id: str) -> Optional[Person]:
         """Get Person node"""
@@ -869,17 +870,25 @@ class GraphStore:
                 pass
         return None
     
-    def get_preference(self, pref_id: str) -> Optional[Preference]:
-        """Get Preference node"""
-        data = self.get_node(pref_id)
-        if data:
-            try:
-                # Add id field (node_id is the key, not in data)
-                data_with_id = {**data, "id": pref_id}
-                return Preference(**data_with_id)
-            except Exception:
-                pass
-        return None
+    def get_edges_by_type(self, rel_type: str) -> List[Dict[str, Any]]:
+        """Get all edges of a specific relation type
+        
+        Args:
+            rel_type: Relation type to filter (e.g., 'CLAIMS', 'INVOLVED_IN')
+            
+        Returns:
+            List of edge dictionaries with 'head_id', 'tail_id', and edge data
+        """
+        edges = []
+        for u, v, key, data in self._g.edges(keys=True, data=True):
+            if data.get('rel_type') == rel_type:
+                edges.append({
+                    'head_id': u,
+                    'tail_id': v,
+                    'key': key,
+                    **data
+                })
+        return edges
     
     # --- Time-aware queries ---
     
@@ -944,35 +953,56 @@ class GraphStore:
     
     def get_events_by_time_range(
         self,
-        time_start: Optional[str] = None,
-        time_end: Optional[str] = None
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        entity_id: Optional[str] = None
     ) -> List[Event]:
-        """Get events within time range (type-safe with NodeType enum)"""
+        """Get events within time range (type-safe with NodeType enum)
+        
+        Args:
+            start_time: Start time in ISO-8601 format
+            end_time: End time in ISO-8601 format
+            entity_id: Optional entity ID to filter events for a specific person/entity
+            
+        Returns:
+            List of Event objects sorted by timestamp
+        """
         events = []
         for node_id, data in self._g.nodes(data=True):
             # Use node_type field with NodeType enum for type checking
             if data.get("node_type") == NodeTypeEnum.EVENT.value:
                 try:
                     event = Event(**data)
+                    
+                    # Filter by entity if specified
+                    if entity_id and entity_id not in event.participants:
+                        continue
 
-                    if time_start and event.time_end:
+                    # Check if event overlaps with time range
+                    if start_time and end_time:
+                        if not event.overlaps_with(start_time, end_time):
+                            continue
+                    elif start_time and event.time_end:
                         try:
-                            if datetime.fromisoformat(event.time_end.replace('Z', '+00:00')) < datetime.fromisoformat(time_start.replace('Z', '+00:00')):
+                            if datetime.fromisoformat(event.time_end.replace('Z', '+00:00')) < datetime.fromisoformat(start_time.replace('Z', '+00:00')):
                                 continue
                         except Exception:
                             pass
-
-                    if time_end and event.time_start:
+                    elif end_time and event.time_start:
                         try:
-                            if datetime.fromisoformat(event.time_start.replace('Z', '+00:00')) > datetime.fromisoformat(time_end.replace('Z', '+00:00')):
+                            if datetime.fromisoformat(event.time_start.replace('Z', '+00:00')) > datetime.fromisoformat(end_time.replace('Z', '+00:00')):
                                 continue
                         except Exception:
                             pass
 
                     events.append(event)
-                except Exception:
+                except Exception as e:
+                    if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
+                        print(f"[GraphStore] Error parsing event {node_id}: {e}")
                     continue
-
+        
+        # Sort by timestamp
+        events.sort(key=lambda e: e.timestamp or "")
         return events
     
     # --- SUPERSEDES chain traversal ---
@@ -1049,50 +1079,6 @@ class GraphStore:
             return 0.0
         return math.log(degree) * base_penalty
 
-    # ============================================================================
-    # Temporal Index and Query Methods (Phase 3)
-    # ============================================================================
-
-    def get_events_by_time_range(
-        self,
-        start_time: str,
-        end_time: str,
-        entity_id: Optional[str] = None
-    ) -> List[Event]:
-        """Get events within a specific time range (Phase 3) with NodeType enum
-
-        Args:
-            start_time: Start time in ISO-8601 format
-            end_time: End time in ISO-8601 format
-            entity_id: Optional entity ID to filter events for a specific person/entity
-
-        Returns:
-            List of Event objects sorted by timestamp
-        """
-        events = []
-
-        for node_id, data in self._g.nodes(data=True):
-            if data.get("node_type") == NodeTypeEnum.EVENT.value:
-                try:
-                    event = Event(**data)
-
-                    # Filter by entity if specified
-                    if entity_id and entity_id not in event.participants:
-                        continue
-
-                    # Check if event overlaps with time range
-                    if event.overlaps_with(start_time, end_time):
-                        events.append(event)
-
-                except Exception as e:
-                    print(f"[GraphStore] Error parsing event {node_id}: {e}")
-                    continue
-
-        # Sort by timestamp
-        events.sort(key=lambda e: e.timestamp or "")
-
-        return events
-
     def get_facts_by_entity_and_time(
         self,
         subject_id: str,
@@ -1143,4 +1129,3 @@ class GraphStore:
                     continue
 
         return facts
-

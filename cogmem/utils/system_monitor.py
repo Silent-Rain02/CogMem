@@ -6,7 +6,6 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-
 @dataclass
 class OperationMetrics:
     """Metrics for a single operation."""
@@ -17,7 +16,6 @@ class OperationMetrics:
     success: bool = True
     error_message: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-
 
 @dataclass
 class RetrievalMetrics:
@@ -33,7 +31,6 @@ class RetrievalMetrics:
     fallback_used: bool = False
     error_occurred: bool = False
     error_details: Optional[str] = None
-
 
 class SystemMonitor:
     """System-wide monitoring and performance tracking."""
@@ -228,7 +225,6 @@ class SystemMonitor:
             self._completed_operations.clear()
             self._retrieval_history.clear()
             self._active_operations.clear()
-
 
 # Global monitor instance
 monitor = SystemMonitor()

@@ -8,6 +8,7 @@ except Exception:
     pass
 
 from .cogmem import CogMem
+from .config import CogMemConfig, DEFAULT_CONFIG, ModelConfig
 
-__all__ = ["CogMem"]
+__all__ = ["CogMem", "CogMemConfig", "DEFAULT_CONFIG", "ModelConfig"]
 __version__ = "0.1.0"

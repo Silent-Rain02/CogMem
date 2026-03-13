@@ -6,7 +6,6 @@ from typing import Dict, Iterable, List, Tuple
 import faiss  # type: ignore
 import numpy as np
 
-
 class VectorStore:
     def __init__(self, dim: int, metric: str = "cosine") -> None:
         self._dim = dim

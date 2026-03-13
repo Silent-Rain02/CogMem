@@ -1,51 +1,60 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
-
+from typing import Optional, Dict, Any, Literal
+import re
 
 @dataclass
 class ModelConfig:
-    provider: str = "bailian"  # bailian | ollama
-    chat_model: str = "qwen-flash"
-    embedding_model: str = "text-embedding-v3"
-    embedding_dim: int = 1536
+    # === 主要Provider配置 ===
+    provider: str = "siliconflow"  # bailian | ollama | siliconflow | modelscope（默认）
+    
+    # === 分离配置：允许Chat和Embedding使用不同的Provider ===
+    # 如果设置了embedding_provider，则embedding使用单独的provider，否则跟随主provider
+    embedding_provider: Optional[str] = "siliconflow"  # None | ollama | siliconflow | modelscope
+    
     # 可选：直接在配置中提供 OpenAI 兼容接口的 Base URL 与 API Key（优先级高于环境变量）
     api_base_url: Optional[str] = None
     api_key: Optional[str] = None
-    # Ollama 可选：本地服务地址与模型名称兼容字段
-    ollama_base_url: Optional[str] = None
-    ollama_chat_model: Optional[str] = None
-    ollama_embedding_model: Optional[str] = None
+    embedding_dim: Optional[int] = 1024  # Will be auto-detected
 
+    # 聊天模型配置
+    chat_model: Optional[str] = None  # 通用聊天模型
+    ollama_chat_model: Optional[str] = "phi4"  # Ollama专用聊天模型
+
+
+    siliconflow_chat_model: Optional[str] = "Qwen/Qwen2.5-14B-Instruct"  # SiliconFlow专用聊天模型
+    modelscope_chat_model: Optional[str] = "qwen2.5-14b-instruct"  # ModelScope专用聊天模型
+
+    # 嵌入模型配置
+    embedding_model: Optional[str] = None  # 通用嵌入模型
+    ollama_embedding_model: Optional[str] = "bge-m3"  # Ollama专用嵌入模型
+    siliconflow_embedding_model: Optional[str] = "BAAI/bge-m3"  # SiliconFlow专用嵌入模型
+    modelscope_embedding_model: Optional[str] = "bge-m3"  # ModelScope专用嵌入模型
+
+    # Ollama 配置
+    ollama_base_url: Optional[str] = "http://localhost:11434"
+    
+    # SiliconFlow 配置
+    siliconflow_api_key: Optional[str] = None  # 从环境变量 SILICONFLOW_API_KEY 读取
+    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+    
+    # ModelScope 配置
+    modelscope_api_key: str = "empty"
+    modelscope_base_url: str = "http://localhost:8000/v1"
+    modelscope_embedding_base_url: Optional[str] = None  # 如果为 None 则使用 base_url
 
 @dataclass
 class FAISSConfig:
     metric: str = "cosine"  # cosine | l2
-    index_type: str = "IndexFlatIP"  # IndexFlatIP for cosine
-    rebuild_on_load: bool = False
-
-
-@dataclass
-class CommunityConfig:
-    enable_structure: bool = True
-    leiden_resolution: float = 1.0
-    semantic_k: int = 8  # Reduced from 16 to prevent over-segmentation
-
+    enable_global_index: bool = False  # 全局索引开关（Pure Graph Mode建议关闭以节省内存）
+    use_vector_search: bool = True  # 是否使用向量检索（False 时完全禁用 Stage 3）
 
 @dataclass
 class RuntimeConfig:
-    batch_size: int = 8  # 注意：百炼API限制batch_size <= 10，实际使用时会自动限制
-    max_concurrency: int = 8
-    request_timeout_s: int = 60
-    retry_times: int = 3
-
-
-@dataclass
-class Thresholds:
-    exact_match_norm: bool = True
-    min_similarity: float = 0.25
-
+    batch_size: int = 2
+    max_concurrency: int = 2
+    request_timeout_s: int = 300
 
 @dataclass
 class ChunkConfig:
@@ -56,54 +65,187 @@ class ChunkConfig:
     # 通用场景
     general_chunk_size: int = 300
     general_overlap: int = 50
-
-
-@dataclass
-class PersonCenteredConfig:
-    """Person-centered graph configuration"""
-    enable_event_mediation: bool = True  # Use event-mediated construction
-    enable_person_facets: bool = True  # Create PersonFacet nodes
-    hub_penalty_weight: float = 0.1  # Base penalty for hub nodes
-    time_validity_default_days: int = 365  # Default validity period for facts
-    multi_community_threshold: float = 0.3  # Threshold for multi-community membership
-    max_facet_edges_per_person: int = 50  # Max edges per person facet
-
+    # Pure Graph Mode 核心开关
+    enable_chunk_embedding: bool = False  # 默认为 False，关闭原文嵌入（Pure Graph Mode）
+    keep_raw_text: bool = True  # 是否保留原文用于展示（不嵌入但存储，用于回溯到原文）
 
 @dataclass
 class ExtractionConfig:
-    """提取配置"""
-    entity_extractor: str = "llm"  # llm | rule
-    relation_extractor: str = "llm"
-    enable_temporal_extraction: bool = True  # 时间实体识别
+    """提取配置 (v3.3 Enhanced)"""
     use_enhanced_extraction: bool = True  # 使用增强版实体抽取（更丰富的描述）
-    use_person_centered: bool = False  # Enable person-centered extraction
-    use_person_facets: bool = False  # Enable PersonFacet nodes (requires use_person_centered)
+    use_person_centered: bool = True  # 默认启用人物中心模式
+    skip_incomplete_facts: bool = True  # 跳过不完整的事实（缺少object和purpose）
+    extract_facts_during_indexing: bool = True  # 是否在索引时提取Fact节点（False时只在记忆巩固时创建Fact）
+    # v3.3: 时间解析增强
+    resolve_relative_time: bool = True  # 是否将相对时间（yesterday）解析为绝对时间
+    create_temporal_edges: bool = True  # 是否创建时间边（HAPPENED_BEFORE, HAPPENED_DURING）
+    # v3.3: Concept层级
+    build_concept_hierarchy: bool = True  # 是否构建Concept层级关系
 
+# ============================================================================
+# Question Type Classification (v3.3 New)
+# ============================================================================
+
+QuestionType = Literal["single_hop", "multi_hop", "temporal", "open_domain", "adversarial"]
+
+def classify_question_type(query: str) -> QuestionType:
+    """Classify question type based on keywords and patterns (v3.3 Enhancement)
+    
+    This helps the SearchAgent choose optimal tool strategies.
+    
+    Returns:
+        QuestionType: One of "single_hop", "multi_hop", "temporal", "open_domain", "adversarial"
+    """
+    query_lower = query.lower()
+    
+    # Multi-hop indicators: questions involving multiple entities or relationships
+    multi_hop_patterns = [
+        r'\b(both|common|shared|together|each other|relationship between)\b',
+        r'\b(\w+)\s+and\s+(\w+)\b.*\b(both|common|shared)\b',
+        r'\bwhat do .+ and .+ (have in common|share)\b',
+    ]
+    for pattern in multi_hop_patterns:
+        if re.search(pattern, query_lower):
+            return "multi_hop"
+    
+    # Temporal indicators: questions about time
+    temporal_patterns = [
+        r'\b(when|what time|what date|how long|how many (days|weeks|months|years))\b',
+        r'\b(before|after|during|since|until|ago)\b',
+        r'\b(first|last|recent|latest|earliest)\b',
+        r'\b\d{4}\b',  # Year mention
+    ]
+    temporal_count = sum(1 for p in temporal_patterns if re.search(p, query_lower))
+    if temporal_count >= 2:
+        return "temporal"
+    
+    # Adversarial indicators: questions that might have no answer or trick questions
+    adversarial_patterns = [
+        r'\b(did .+ ever|has .+ ever|was there)\b.*\?',
+        r'\b(never|not|no)\b.*\b(mention|say|discuss)\b',
+    ]
+    for pattern in adversarial_patterns:
+        if re.search(pattern, query_lower):
+            return "adversarial"
+    
+    # Open domain indicators: questions requiring world knowledge or inference
+    open_domain_patterns = [
+        r'\b(would|could|might|should|likely|probably)\b',
+        r'\b(why|how does|what kind of|what type of)\b',
+        r'\b(opinion|think|feel|believe)\b',
+    ]
+    for pattern in open_domain_patterns:
+        if re.search(pattern, query_lower):
+            return "open_domain"
+    
+    # Default: single-hop (direct fact lookup)
+    return "single_hop"
 
 @dataclass
-class RetrievalConfig:
-    gap_max_steps: int = 2
-    fusion_semantic_weight: float = 0.6
-    fusion_structure_weight: float = 0.4
-    topk_candidates: int = 50
-    # 新增：片段检索配置
-    chunk_top_k: int = 10
-    enable_chunk_retrieval: bool = True
-    enable_reranking: bool = True
+class AgentConfig:
+    """Agent 配置 (v3.3 Enhanced with Dynamic Configuration)"""
+    max_iterations: int = 4  # SearchAgent 默认迭代次数；题型配置会进一步覆盖
+    
+    # ===== 搜索工具参数配置 =====
+    # 基于真实索引数据分析（analyze_node_lengths.py）和模型上下文窗口设计
+    # Qwen2.5-14B-Instruct: 128K context window
+    # 真实数据（P95 tokens/节点）：
+    #   - EVENT: 71 tokens（最长）
+    #   - CLAIM: 18 tokens
+    #   - FACT: 15 tokens
+    #   - CONCEPT: 7 tokens
+    #   - PERSON: 7 tokens
+    # 
+    # 上下文分配：
+    #   - 系统提示词: ~3K tokens
+    #   - 用户问题: ~0.5K tokens
+    #   - 历史推理 (10 steps): ~10K tokens
+    #   - 单次工具调用观察结果: ~5-10K tokens（保守估计）
+    #   - 可用空间: ~115K tokens（但需要为多次调用留出空间）
+    
+    # semantic_search: 核心工具，用于内容检索（主要返回 FACT/EVENT/CLAIM）
+    # 考虑最坏情况：全部是 EVENT（71 tokens/节点），10个节点 = 710 tokens
+    # 但通常混合类型，平均约 30 tokens/节点，10个节点 = 300 tokens（安全）
+    semantic_search_top_k: int = 10  # 默认10个结果，约300-700 tokens（适合内容问题）
+    
+    # find_anchors: 实体查找，用于初始锚点（主要返回 PERSON/CONCEPT）
+    # PERSON/CONCEPT 平均 7 tokens/节点，5个节点 = 35 tokens（非常轻量）
+    find_anchors_top_k: int = 5  # 默认5个结果，约35 tokens（足够找到主要实体）
+    
+    # traverse_neighbors: 关系遍历，用于探索连接（可能返回各种类型）
+    # 保守估计：平均 30 tokens/节点，10个节点 = 300 tokens
+    traverse_neighbors_max_results: int = 10  # 默认返回10个结果，约300 tokens
+    traverse_neighbors_max_depth: int = 1  # 默认遍历深度为1（直接邻居）
+    
+    # find_common_ground: 多跳查询，用于查找共同节点（主要返回 CONCEPT/EVENT）
+    # 混合类型平均约 20 tokens/节点，5个节点 = 100 tokens
+    find_common_ground_top_k: int = 5  # 默认5个共同节点，约100 tokens
+    
+    # 向量搜索扩展倍数（用于提高召回率）
+    # 在按类型搜索时，先检索更多候选，然后取 top_k
+    vector_search_expansion_factor: float = 2.0  # semantic_search 按类型搜索时，每个类型检索 top_k * factor 个结果
+    
+    # v3.3: Evidence grounding 增强
+    require_evidence_for_answer: bool = True  # 是否强制要求 get_evidence 后才能给出 final_answer
+    auto_get_evidence: bool = True  # 是否在 semantic_search 后自动获取 evidence
 
+    # Skill Runtime 开关（论文消融与 trace）
+    enable_routing_skill: bool = True
+    enable_evidence_skill: bool = True
+    enable_temporal_skill: bool = True
+    enable_common_ground_skill: bool = True
+    enable_trace: bool = True
+    enable_runtime_cache: bool = True
+
+    def get_config_for_question_type(self, question_type: QuestionType) -> Dict[str, Any]:
+        """Get optimized configuration for a specific question type (v3.3 Enhancement)
+        
+        Args:
+            question_type: The classified question type
+            
+        Returns:
+            Dict with overridden configuration values
+        """
+        configs: Dict[QuestionType, Dict[str, Any]] = {
+            "single_hop": {
+                "semantic_search_top_k": 4,  # 单跳问题不需要太多结果
+                "max_iterations": 3,
+                "traverse_neighbors_max_depth": 1,
+                "require_evidence_for_answer": True,  # 单跳必须有证据
+            },
+            "multi_hop": {
+                "semantic_search_top_k": 8,  # 多跳需要一定候选，但不能过宽
+                "max_iterations": 5,
+                "find_common_ground_top_k": 6,
+                "traverse_neighbors_max_depth": 2,  # 允许更深遍历
+            },
+            "temporal": {
+                "semantic_search_top_k": 6,
+                "max_iterations": 4,
+                "traverse_neighbors_max_results": 12,
+                "traverse_neighbors_max_depth": 1,
+            },
+            "open_domain": {
+                "semantic_search_top_k": 6,
+                "max_iterations": 4,
+                "require_evidence_for_answer": False,  # 开放域可能需要推理
+            },
+            "adversarial": {
+                "semantic_search_top_k": 5,
+                "max_iterations": 3,
+                "require_evidence_for_answer": True,  # 对抗性问题必须有证据
+            },
+        }
+        return configs.get(question_type, {})
 
 @dataclass
 class CogMemConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     faiss: FAISSConfig = field(default_factory=FAISSConfig)
-    community: CommunityConfig = field(default_factory=CommunityConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    thresholds: Thresholds = field(default_factory=Thresholds)
-    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
-    # 新增
     chunk: ChunkConfig = field(default_factory=ChunkConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
-    person_centered: PersonCenteredConfig = field(default_factory=PersonCenteredConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
 
     # 持久化路径（目录）
     persist_dir: str = ".cogmem"
@@ -111,11 +253,8 @@ class CogMemConfig:
     graph_changelog_file: str = "graph.changelog.pkl"
     faiss_index_file: str = "faiss.index"
     entity_store_file: str = "entities.npy"
-    community_meta_file: str = "communities.json"
-    community_centroid_file: str = "communities_centroids.npy"
     chunk_index_file: str = "chunks.index"
     chunk_meta_file: str = "chunks.pkl"
     evidence_store_file: str = "evidence_store.pkl"  # EvidenceStore持久化文件
-
 
 DEFAULT_CONFIG = CogMemConfig()

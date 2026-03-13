@@ -6,9 +6,114 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Literal, Tuple
 
-
 Granularity = Literal["year", "month", "day", "time"]
 
+def normalize_time_format(time_str: str) -> Optional[str]:
+    """规范化时间字符串为标准ISO-8601格式
+    
+    处理常见的非标准格式：
+    - "1:56 pm on 8 May, 2023" → "2023-05-08T13:56:00"
+    - "8 May, 2023" → "2023-05-08"
+    - "May 2023" → "2023-05-XX"
+    - "2023" → "2023-XX-XX"
+    - "2023-04-01XX" → "2023-04-XX" (修正错误格式)
+    - "YYYY-XX-XX" → None (字面占位符，无效)
+    
+    Args:
+        time_str: 输入的时间字符串
+        
+    Returns:
+        规范化后的ISO-8601格式字符串，如果无法解析则返回None
+    """
+    if not time_str or not isinstance(time_str, str):
+        return None
+    
+    time_str = time_str.strip()
+    
+    # 防止卡死：限制输入长度（时间字符串通常不会超过200字符）
+    MAX_INPUT_LENGTH = 200
+    if len(time_str) > MAX_INPUT_LENGTH:
+        return None
+    
+    # 检查是否是字面占位符（无效）
+    if time_str.upper() in ('YYYY-XX-XX', 'YYYY-MM-XX', 'YYYY-MM-DD', 'YYYY', 'YYYY-MM'):
+        return None
+    
+    # 修正常见错误格式
+    # "2023-04-01XX" → "2023-04-XX"
+    time_str = re.sub(r'(\d{4})-(\d{2})-\d{2}XX', r'\1-\2-XX', time_str)
+    # "2022-04-XE" → "2022-04-XX" (拼写错误)
+    time_str = re.sub(r'(\d{4})-(\d{2})-X[A-Z]', r'\1-\2-XX', time_str, flags=re.IGNORECASE)
+    
+    # 修正缺少秒数的时间格式："2023-05-08T14:56" → "2023-05-08T14:56:00"
+    if re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$', time_str):
+        return time_str + ":00"
+    
+    # 修正时间部分用XX的格式："2023-07-08TXX:XX:XX" → "2023-07-08"（只保留日期）
+    match = re.match(r'^(\d{4}-\d{2}-\d{2})T[X:]+$', time_str, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # 如果已经是标准格式，直接返回（优化正则表达式，避免复杂嵌套）
+    # 简化匹配：先检查基本格式，再检查详细格式
+    if re.match(r'^\d{4}(-\d{2}(-\d{2}(T\d{2}:\d{2}:\d{2})?)?)?$', time_str):
+        return time_str
+    # 检查带XX的格式
+    if re.match(r'^\d{4}(-\d{2}(-\d{2}|-XX)|-XX(-XX)?)$', time_str):
+        return time_str
+    
+    # 解析自然语言格式："1:56 pm on 8 May, 2023"
+    # Pattern: "HH:MM am/pm on DD Month, YYYY"
+    match = re.match(r'(\d{1,2}):(\d{2})\s*(am|pm)\s+on\s+(\d{1,2})\s+(\w+),?\s+(\d{4})', time_str, re.IGNORECASE)
+    if match:
+        hour, minute, ampm, day, month_name, year = match.groups()
+        hour = int(hour)
+        if ampm.lower() == 'pm' and hour != 12:
+            hour += 12
+        elif ampm.lower() == 'am' and hour == 12:
+            hour = 0
+        
+        # 月份名称转数字
+        month_map = {
+            'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+            'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
+            'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9,
+            'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+        }
+        month = month_map.get(month_name.lower())
+        if month:
+            return f"{year}-{month:02d}-{int(day):02d}T{hour:02d}:{int(minute):02d}:00"
+    
+    # 解析日期格式："8 May, 2023" 或 "May 8, 2023"
+    match = re.match(r'(\d{1,2})\s+(\w+),?\s+(\d{4})', time_str)
+    if match:
+        day, month_name, year = match.groups()
+        month_map = {
+            'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+            'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
+            'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9,
+            'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+        }
+        month = month_map.get(month_name.lower())
+        if month:
+            return f"{year}-{month:02d}-{int(day):02d}"
+    
+    # 解析 "Month YYYY" 格式："May 2023"
+    match = re.match(r'(\w+)\s+(\d{4})', time_str)
+    if match:
+        month_name, year = match.groups()
+        month_map = {
+            'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+            'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
+            'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9,
+            'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+        }
+        month = month_map.get(month_name.lower())
+        if month:
+            return f"{year}-{month:02d}-XX"
+    
+    # 如果无法解析，返回None
+    return None
 
 def parse_relative_time(
     text: str,
@@ -28,6 +133,11 @@ def parse_relative_time(
         Tuple of (time_start, time_end, granularity, confidence)
         Returns (None, None, None, 0.0) if parsing fails
     """
+    # 防止卡死：限制输入长度
+    MAX_INPUT_LENGTH = 200
+    if not text or len(text) > MAX_INPUT_LENGTH:
+        return None, None, None, 0.0
+    
     text_lower = text.lower().strip()
     
     # Determine anchor
@@ -109,7 +219,6 @@ def parse_relative_time(
     
     return None, None, None, 0.0
 
-
 def parse_absolute_time(text: str) -> Tuple[Optional[str], Optional[str], Optional[Granularity], float]:
     """Parse absolute time expressions to ISO-8601 format
     
@@ -119,6 +228,11 @@ def parse_absolute_time(text: str) -> Tuple[Optional[str], Optional[str], Option
     Returns:
         Tuple of (time_start, time_end, granularity, confidence)
     """
+    # 防止卡死：限制输入长度
+    MAX_INPUT_LENGTH = 200
+    if not text or len(text) > MAX_INPUT_LENGTH:
+        return None, None, None, 0.0
+    
     text = text.strip()
     
     # ISO-8601 format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
@@ -204,7 +318,6 @@ def parse_absolute_time(text: str) -> Tuple[Optional[str], Optional[str], Option
     
     return None, None, None, 0.0
 
-
 def normalize_time(
     text: str,
     anchor_date: Optional[str] = None,
@@ -244,7 +357,6 @@ def normalize_time(
         "anchor": anchor
     }
 
-
 def _add_months(dt: datetime, months: int) -> Tuple[datetime, Granularity, float]:
     """Add months to a datetime"""
     month = dt.month - 1 + months
@@ -252,7 +364,6 @@ def _add_months(dt: datetime, months: int) -> Tuple[datetime, Granularity, float
     month = month % 12 + 1
     day = min(dt.day, [31, 29 if year % 4 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
     return datetime(year, month, day), "month", 0.8
-
 
 def _get_day_of_week(anchor: datetime, day_name: str, last: bool) -> Tuple[datetime, Granularity, float]:
     """Get the most recent or next occurrence of a day of week"""
@@ -272,4 +383,3 @@ def _get_day_of_week(anchor: datetime, day_name: str, last: bool) -> Tuple[datet
         result = anchor + timedelta(days=days_ahead)
     
     return result, "day", 0.7
-

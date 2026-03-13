@@ -6,7 +6,6 @@ from typing import Generic, Hashable, Optional, TypeVar
 K = TypeVar("K", bound=Hashable)
 V = TypeVar("V")
 
-
 class LRUCache(Generic[V]):
     def __init__(self, capacity: int = 1024) -> None:
         self._cap = max(1, capacity)

@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 
-
 @dataclass
 class Counter:
     calls: int = 0
@@ -14,7 +13,6 @@ class Counter:
     completion_tokens: int = 0
     total_tokens: int = 0
     total_latency_ms: float = 0.0
-
 
 class MetricsTracker:
     def __init__(self) -> None:
@@ -57,7 +55,6 @@ class MetricsTracker:
         with self._lock:
             self._chat = Counter()
             self._embed = Counter()
-
 
 # 全局单实例
 METRICS = MetricsTracker()

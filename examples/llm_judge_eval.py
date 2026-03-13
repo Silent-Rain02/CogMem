@@ -1,249 +1,376 @@
-"""LLM as Judge 评测模块：使用大模型评估开放域问答质量"""
+"""
+LLM-as-Judge evaluation module for LoCoMo and LongMemEval datasets.
 
-import json
-import time
-from typing import Dict, List, Optional
+This module provides a standardized way to evaluate model answers against
+ground truth using LLM-as-a-Judge paradigm, which is the recommended approach
+for both LoCoMo and LongMemEval benchmarks.
+
+References:
+    - LoCoMo: https://snap-research.github.io/locomo
+    - LongMemEval: https://github.com/Wuhan-AI/LongMemEval
+    - LLM-as-a-Judge: Gu et al., 2024
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Optional, Dict, Any, Literal
 from dataclasses import dataclass
-
-from cogmem.models.llm_client import create_llm_client
-from cogmem.config import CogMemConfig
 
 
 @dataclass
 class JudgeResult:
-    """评测结果"""
-    semantic_correctness: float  # 语义正确性 (0-1)
-    completeness: float         # 完整性 (0-1)
-    relevance: float           # 相关性 (0-1)
-    overall_score: float       # 综合分数 (0-1)
-    explanation: str           # 评测说明
+    """LLM Judge evaluation result."""
+    is_correct: bool
+    confidence: float
+    reasoning: str
+    raw_output: str
 
 
 class LLMJudge:
-    """LLM 评测器：使用大模型评估问答质量"""
+    """
+    LLM-as-Judge evaluator for conversational QA benchmarks.
     
-    def __init__(self, config: CogMemConfig):
-        self.llm = create_llm_client(config)
-        
-    def evaluate_answer(
-        self, 
-        question: str, 
-        gold_answer: str, 
-        predicted_answer: str,
-        category: Optional[str] = None
-    ) -> JudgeResult:
-        """使用 LLM 评估答案质量
-        
-        Args:
-            question: 问题
-            gold_answer: 标准答案
-            predicted_answer: 预测答案
-            category: 问题类别（可选）
-            
-        Returns:
-            评测结果
+    This judge is designed to work with:
+    - LoCoMo (Long Conversational Memory) dataset
+    - LongMemEval (Long-term Memory Evaluation) dataset
+    
+    The evaluation uses a strong LLM (e.g., GPT-4o, Gemini-1.5-Pro) to compare
+    generated responses against reference answers, avoiding the brittleness of
+    exact string matching while accounting for paraphrases and semantically
+    equivalent answers.
+    
+    Usage:
+        judge = LLMJudge(client)
+        result = judge.evaluate(
+            question="What is user's favorite color?",
+            predicted="Blue",
+            ground_truth="The user likes blue."
+        )
+        print(result.is_correct)  # True
+    """
+    
+    # Standard LLM-as-Judge prompt based on LoCoMo and LongMemEval papers
+    # This is the widely adopted prompt for evaluating QA correctness
+    DEFAULT_JUDGE_PROMPT = """You are an expert evaluator for question answering systems. Your task is to determine if the predicted answer correctly answers the question, compared to the ground truth answer.
+
+Evaluation Guidelines:
+1. Semantic Equivalence: The predicted answer should convey the same meaning as the ground truth, even if worded differently.
+2. Partial Credit: If the predicted answer contains the core correct information but adds extra details, it should still be considered correct.
+3. Date/Time Flexibility: Different date formats (e.g., "2023-05-07", "May 7, 2023", "7th May") should be treated as equivalent.
+4. Synonyms: Accept synonymous expressions (e.g., "happy" ≈ "joyful", "scared" ≈ "afraid").
+5. Lists: If the ground truth is a list, the prediction must contain the key items. Missing items or extra items may be acceptable depending on context.
+6. Negation: Be careful with negations. "He went" is NOT the same as "He did not go".
+7. Unanswerable: If the question is unanswerable from the context, the prediction should indicate this (e.g., "I don't know", "not mentioned").
+
+Question: {question}
+Ground Truth: {ground_truth}
+Predicted Answer: {predicted}
+
+First, analyze the predicted answer compared to the ground truth. Consider:
+- Does it contain the key information from the ground truth?
+- Are there any contradictions?
+- Is the level of detail appropriate?
+
+Then, provide your judgment:
+- Output "CORRECT" if the predicted answer is semantically equivalent to the ground truth
+- Output "INCORRECT" if the predicted answer is wrong, contradicts the ground truth, or misses critical information
+- Output "UNCERTAIN" if you cannot confidently determine correctness
+
+Output format:
+Judgment: [CORRECT/INCORRECT/UNCERTAIN]
+Confidence: [0-100]
+Reasoning: [Brief explanation of your decision]"""
+
+    # Simplified binary judge prompt (for faster evaluation)
+    BINARY_JUDGE_PROMPT = """You are an impartial semantic judge evaluating a Question Answering system.
+
+Context:
+- Question: "{question}"
+- Ground Truth: "{ground_truth}"
+- Predicted Answer: "{predicted}"
+
+Task: Determine if the Predicted Answer conveys the SAME meaning as the Ground Truth.
+
+Evaluation Rules (Be Flexible):
+1. Dates: Treat "2023-05-07", "May 7th, 2023", "7/5/23" as EQUIVALENT.
+2. Synonyms: "Happy" == "Joyful", "Scared" == "Afraid".
+3. Verbosity: If the Prediction is long but contains the correct answer, it is CORRECT.
+4. Lists: If the Truth is a list, the Prediction must contain the key items.
+5. Negation: Watch out for "NOT". "He went" != "He did not go".
+
+Output: Respond ONLY with "YES" if correct, or "NO" if incorrect."""
+
+    # LongMemEval specific judge prompt (based on the original paper)
+    LONGMEMEVAL_JUDGE_PROMPT = """You are evaluating answers for a long-term conversational memory benchmark.
+
+Question: {question}
+Ground Truth Answer: {ground_truth}
+Model's Answer: {predicted}
+
+Evaluate if the model's answer correctly answers the question based on the ground truth.
+The model's answer may be phrased differently but should convey the same meaning.
+
+Consider:
+- Is the core information correct?
+- Are temporal references accurate (e.g., "last week", "two days ago")?
+- Does the answer reflect the user's preferences/stated information correctly?
+- Is there any contradiction with the ground truth?
+
+Respond with only one word: "YES" if correct, "NO" if incorrect."""
+
+    # LoCoMo specific judge prompt with categories support
+    LOCOMO_JUDGE_PROMPT = """You are an evaluator for the LoCoMo (Long Conversational Memory) benchmark.
+
+Question Type: {question_type}
+Question: {question}
+Ground Truth: {ground_truth}
+Predicted Answer: {predicted}
+
+Evaluation Criteria by Question Type:
+- single_hop: Direct factual recall from one conversation turn
+- multi_hop: Synthesis of information across multiple turns  
+- temporal: Correct understanding of time relationships and ordering
+- open_domain: General knowledge integration with conversation context
+- adversarial: Correctly identifying unanswerable or trick questions
+
+Task: Determine if the predicted answer is semantically equivalent to the ground truth.
+
+Rules:
+1. Accept paraphrases and different wordings with the same meaning
+2. Treat different date/time formats as equivalent
+3. Accept synonyms and equivalent expressions
+4. For adversarial questions, "I don't know" or similar is correct if the question is unanswerable
+5. The answer should not contradict any information in the ground truth
+
+Output format:
+Judgment: [YES/NO]
+Reason: [One sentence explanation]"""
+
+    def __init__(
+        self,
+        client: Any,
+        prompt_type: Literal["default", "binary", "longmemeval", "locomo"] = "default",
+        custom_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+    ):
         """
-        system_prompt = self._get_judge_system_prompt()
-        user_prompt = self._format_judge_prompt(question, gold_answer, predicted_answer, category)
-        
-        try:
-            response = self.llm.chat(system_prompt, user_prompt)
-            result_dict = json.loads(response.strip())
-            
-            return JudgeResult(
-                semantic_correctness=float(result_dict.get("semantic_correctness", 0.0)),
-                completeness=float(result_dict.get("completeness", 0.0)),
-                relevance=float(result_dict.get("relevance", 0.0)),
-                overall_score=float(result_dict.get("overall_score", 0.0)),
-                explanation=result_dict.get("explanation", "")
-            )
-            
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            # 解析失败时返回默认结果
-            return JudgeResult(
-                semantic_correctness=0.0,
-                completeness=0.0,
-                relevance=0.0,
-                overall_score=0.0,
-                explanation=f"评测解析失败: {str(e)}"
-            )
-    
-    def _get_judge_system_prompt(self) -> str:
-        """获取评测系统提示"""
-        return """你是专业的问答质量评估助手。你的任务是客观、准确地评估问答系统的回答质量。
-
-评估原则：
-1. 语义正确性：预测答案是否在语义上正确，即使表达方式不同
-2. 完整性：预测答案是否包含了回答问题所需的关键信息
-3. 相关性：预测答案是否直接回答了问题，没有偏离主题
-
-【关键规则：无法回答的情况】
-如果预测答案表示"无法确定"、"cannot determine"、"不知道"、"不确定"等，而标准答案提供了具体信息，则：
-- 语义正确性: 0.0-0.2（因为无法确定 ≠ 正确答案）
-- 完整性: 0.0-0.2（完全没有提供答案）
-- 相关性: 0.0-0.3（虽然承认无法回答，但没有回答问题）
-- 综合分数: 0.0-0.2（严重失败）
-
-例外情况：只有当标准答案也是"无法确定"或"无信息"时，预测答案"cannot determine"才能得到高分。
-
-评分标准：
-- 1.0: 完美/优秀，完全正确且完整
-- 0.8-0.9: 很好，有小瑕疵或轻微不完整
-- 0.6-0.7: 一般，缺少部分信息或有轻微错误
-- 0.4-0.5: 较差，信息不完整或有明显错误
-- 0.0-0.3: 很差，完全错误、无关、或无法回答（当标准答案有具体内容时）
-
-请严格按照JSON格式返回结果，不要包含任何其他文本。"""
-
-    def _format_judge_prompt(
-        self, 
-        question: str, 
-        gold_answer: str, 
-        predicted_answer: str,
-        category: Optional[str] = None
-    ) -> str:
-        """格式化评测提示"""
-        category_info = f"\n问题类别: {category}" if category else ""
-        
-        # 检测预测答案是否为"无法确定"类型
-        pred_lower = predicted_answer.lower().strip()
-        is_cannot_determine = any(phrase in pred_lower for phrase in [
-            "cannot determine", "cannot be determined", "cannot be determined from",
-            "无法确定", "无法判断", "不确定", "不知道", "没有信息", "无信息",
-            "no information", "not available", "not mentioned", "not found"
-        ])
-        
-        # 检测标准答案是否为"无法确定"类型
-        gold_lower = gold_answer.lower().strip()
-        gold_is_unknown = any(phrase in gold_lower for phrase in [
-            "cannot determine", "无法确定", "不确定", "不知道", "无信息",
-            "no information", "not available", "not mentioned"
-        ])
-        
-        # 构建特殊提示
-        special_instruction = ""
-        if is_cannot_determine and not gold_is_unknown:
-            special_instruction = """
-【⚠️ 重要：无法回答的情况】
-预测答案表示"无法确定"，但标准答案提供了具体信息（"{gold_answer}"）。
-这是一个严重的失败：系统应该能够回答这个问题，但选择了放弃。
-请严格按照以下评分：
-- 语义正确性: 0.0-0.2（无法确定 ≠ 正确答案）
-- 完整性: 0.0-0.2（完全没有提供答案）
-- 相关性: 0.0-0.3（虽然承认无法回答，但没有回答问题）
-- 综合分数: 0.0-0.2（严重失败）
-
-请明确说明这是"无法回答"导致的失败。
-""".format(gold_answer=gold_answer)
-        elif is_cannot_determine and gold_is_unknown:
-            special_instruction = """
-【特殊情况：双方都表示无法确定】
-预测答案和标准答案都表示"无法确定"，这是正确的。
-请给予高分（0.8-1.0），因为系统正确识别了无法回答的情况。
-"""
-        
-        return f"""请评估以下问答的质量：
-
-问题: {question}{category_info}
-标准答案: {gold_answer}
-预测答案: {predicted_answer}
-{special_instruction}
-请从以下三个维度评估（每个维度0-1分）：
-1. 语义正确性: 预测答案是否语义正确（允许表达方式不同）
-2. 完整性: 是否包含回答问题所需的关键信息
-3. 相关性: 是否直接回答问题，没有偏离主题
-
-综合分数 = (语义正确性 * 0.4 + 完整性 * 0.4 + 相关性 * 0.2)
-
-【评分示例】
-示例1: 问题="When did X happen?", 标准答案="2022", 预测答案="cannot determine"
-→ 语义正确性: 0.1, 完整性: 0.1, 相关性: 0.2, 综合分数: 0.12（严重失败）
-
-示例2: 问题="What is X?", 标准答案="Y", 预测答案="Y"
-→ 语义正确性: 1.0, 完整性: 1.0, 相关性: 1.0, 综合分数: 1.0（完美）
-
-返回JSON格式：
-{{
-    "semantic_correctness": 0.8,
-    "completeness": 0.6,
-    "relevance": 0.9,
-    "overall_score": 0.74,
-    "explanation": "预测答案语义正确但不够完整，缺少具体细节"
-}}"""
-
-    def batch_evaluate(
-        self, 
-        evaluations: List[Dict]
-    ) -> List[JudgeResult]:
-        """批量评估
+        Initialize the LLM Judge.
         
         Args:
-            evaluations: 评估数据列表，每个包含 question, gold_answer, predicted_answer
+            client: LLM client with `chat()` method (e.g., from cogmem.models.llm_client)
+            prompt_type: Which predefined prompt to use
+                - "default": Standard detailed evaluation prompt
+                - "binary": Fast YES/NO prompt
+                - "longmemeval": LongMemEval specific prompt
+                - "locomo": LoCoMo specific prompt with category support
+            custom_prompt: Override with a custom prompt template
+            model: Specific model to use for judging (if None, uses client's default)
+        """
+        self.client = client
+        self.model = model
+        
+        if custom_prompt:
+            self.prompt_template = custom_prompt
+        elif prompt_type == "binary":
+            self.prompt_template = self.BINARY_JUDGE_PROMPT
+        elif prompt_type == "longmemeval":
+            self.prompt_template = self.LONGMEMEVAL_JUDGE_PROMPT
+        elif prompt_type == "locomo":
+            self.prompt_template = self.LOCOMO_JUDGE_PROMPT
+        else:
+            self.prompt_template = self.DEFAULT_JUDGE_PROMPT
+    
+    def evaluate(
+        self,
+        question: str,
+        predicted: str,
+        ground_truth: str,
+        question_type: Optional[str] = None,
+    ) -> JudgeResult:
+        """
+        Evaluate a single prediction against ground truth.
+        
+        Args:
+            question: The question being asked
+            predicted: The model's predicted answer
+            ground_truth: The reference/ground truth answer
+            question_type: Optional question category (for LoCoMo evaluation)
             
         Returns:
-            评估结果列表
+            JudgeResult with is_correct, confidence, reasoning, and raw_output
+        """
+        # Build prompt
+        prompt_kwargs = {
+            "question": question,
+            "predicted": predicted,
+            "ground_truth": ground_truth,
+        }
+        if question_type:
+            prompt_kwargs["question_type"] = question_type
+            
+        prompt = self.prompt_template.format(**prompt_kwargs)
+        
+        # Call LLM
+        system_msg = "You are an expert evaluator for question answering systems."
+        try:
+            response = self.client.chat(
+                system=system_msg,
+                user=prompt,
+                model=self.model,
+            )
+        except Exception as e:
+            return JudgeResult(
+                is_correct=False,
+                confidence=0.0,
+                reasoning=f"Error during evaluation: {str(e)}",
+                raw_output="",
+            )
+        
+        # Parse response
+        return self._parse_response(response)
+    
+    def _parse_response(self, response: str) -> JudgeResult:
+        """
+        Parse the LLM response to extract judgment.
+        
+        Args:
+            response: Raw LLM output
+            
+        Returns:
+            Parsed JudgeResult
+        """
+        response_upper = response.upper().strip()
+        
+        # Check for binary YES/NO
+        if response_upper in ["YES", "YES.", "YES!"]:
+            return JudgeResult(
+                is_correct=True,
+                confidence=1.0,
+                reasoning="Binary judgment: YES",
+                raw_output=response,
+            )
+        if response_upper in ["NO", "NO.", "NO!"]:
+            return JudgeResult(
+                is_correct=False,
+                confidence=1.0,
+                reasoning="Binary judgment: NO",
+                raw_output=response,
+            )
+        
+        # Try to extract structured judgment
+        # Look for "Judgment: CORRECT/INCORRECT/YES/NO"
+        judgment_match = re.search(
+            r'Judgment:\s*(CORRECT|INCORRECT|YES|NO|UNCERTAIN)',
+            response,
+            re.IGNORECASE
+        )
+        
+        if judgment_match:
+            judgment = judgment_match.group(1).upper()
+            is_correct = judgment in ["CORRECT", "YES"]
+            
+            # Try to extract confidence
+            confidence_match = re.search(
+                r'Confidence:\s*(\d+)',
+                response,
+                re.IGNORECASE
+            )
+            confidence = int(confidence_match.group(1)) / 100.0 if confidence_match else 0.8
+            
+            # Try to extract reasoning
+            reasoning_match = re.search(
+                r'Reason(?:ing)?:\s*(.+?)(?:\n|$)',
+                response,
+                re.IGNORECASE | re.DOTALL
+            )
+            reasoning = reasoning_match.group(1).strip() if reasoning_match else response
+            
+            return JudgeResult(
+                is_correct=is_correct,
+                confidence=confidence,
+                reasoning=reasoning,
+                raw_output=response,
+            )
+        
+        # Fallback: check if response contains "correct" or "incorrect"
+        if "CORRECT" in response_upper and "INCORRECT" not in response_upper:
+            return JudgeResult(
+                is_correct=True,
+                confidence=0.7,
+                reasoning="Response indicates correctness",
+                raw_output=response,
+            )
+        if "INCORRECT" in response_upper:
+            return JudgeResult(
+                is_correct=False,
+                confidence=0.7,
+                reasoning="Response indicates incorrectness",
+                raw_output=response,
+            )
+        
+        # Default to uncertain
+        return JudgeResult(
+            is_correct=False,
+            confidence=0.0,
+            reasoning=f"Could not parse judgment from response: {response[:200]}",
+            raw_output=response,
+        )
+    
+    def evaluate_batch(
+        self,
+        items: list[Dict[str, Any]],
+        show_progress: bool = True,
+    ) -> list[JudgeResult]:
+        """
+        Evaluate a batch of predictions.
+        
+        Args:
+            items: List of dicts with keys "question", "predicted", "ground_truth", 
+                   optionally "question_type"
+            show_progress: Whether to print progress
+            
+        Returns:
+            List of JudgeResult objects
         """
         results = []
+        total = len(items)
         
-        for i, eval_data in enumerate(evaluations):
-            print(f"评估进度: {i+1}/{len(evaluations)}")
-            
-            result = self.evaluate_answer(
-                question=eval_data["question"],
-                gold_answer=eval_data["gold_answer"],
-                predicted_answer=eval_data["predicted_answer"],
-                category=eval_data.get("category")
+        for i, item in enumerate(items):
+            result = self.evaluate(
+                question=item["question"],
+                predicted=item["predicted"],
+                ground_truth=item["ground_truth"],
+                question_type=item.get("question_type"),
             )
-            
             results.append(result)
             
-            # 避免API调用过快
-            time.sleep(0.1)
+            if show_progress and (i + 1) % 10 == 0:
+                correct_so_far = sum(1 for r in results if r.is_correct)
+                print(f"  Progress: {i+1}/{total}, Accuracy: {correct_so_far/(i+1):.2%}")
         
         return results
-
-
-def compute_judge_metrics(results: List[JudgeResult]) -> Dict[str, float]:
-    """计算LLM Judge评测指标
     
-    Args:
-        results: 评测结果列表
+    def calculate_accuracy(self, results: list[JudgeResult]) -> Dict[str, float]:
+        """
+        Calculate accuracy metrics from judge results.
         
-    Returns:
-        聚合指标
-    """
-    if not results:
-        return {}
-    
-    metrics = {
-        "avg_semantic_correctness": sum(r.semantic_correctness for r in results) / len(results),
-        "avg_completeness": sum(r.completeness for r in results) / len(results),
-        "avg_relevance": sum(r.relevance for r in results) / len(results),
-        "avg_overall_score": sum(r.overall_score for r in results) / len(results),
-        "high_quality_ratio": sum(1 for r in results if r.overall_score >= 0.7) / len(results),
-        "total_samples": len(results)
-    }
-    
-    return metrics
-
-
-if __name__ == "__main__":
-    # 测试示例
-    from cogmem.config import DEFAULT_CONFIG
-    
-    judge = LLMJudge(DEFAULT_CONFIG)
-    
-    # 测试单个评估
-    result = judge.evaluate_answer(
-        question="What did John do to help his community last year in his hometown?",
-        gold_answer="Helped renovate a rundown community center.",
-        predicted_answer="John volunteered to help his community last year in his hometown",
-        category="Open Domain"
-    )
-    
-    print("评测结果:")
-    print(f"语义正确性: {result.semantic_correctness:.2f}")
-    print(f"完整性: {result.completeness:.2f}")
-    print(f"相关性: {result.relevance:.2f}")
-    print(f"综合分数: {result.overall_score:.2f}")
-    print(f"说明: {result.explanation}")
+        Args:
+            results: List of JudgeResult objects
+            
+        Returns:
+            Dict with accuracy metrics
+        """
+        if not results:
+            return {"accuracy": 0.0, "total": 0, "correct": 0}
+        
+        correct = sum(1 for r in results if r.is_correct)
+        total = len(results)
+        
+        return {
+            "accuracy": correct / total if total > 0 else 0.0,
+            "total": total,
+            "correct": correct,
+            "incorrect": total - correct,
+        }
