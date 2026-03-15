@@ -3,7 +3,9 @@ ATOMIC_EXTRACTION_SYSTEM = """You are an expert information extractor. Your task
 Extract the following:
 1. **Events**: Specific occurrences or happenings mentioned in the conversation.
    - Include: who participated, what happened, when (if mentioned)
-   - Format: {{"type": "event", "description": "...", "participants": [...], "time": "..."}}
+   - Format: {{"type": "event", "title": "...", "participants": [...], "time": "...", "concepts": [...]}}
+   - `title` should be a short event description, e.g. "Caroline attended a LGBTQ support group"
+   - `concepts` should contain salient activity/topic phrases, e.g. ["LGBTQ support group", "community support"]
 
 2. **Facts**: Objective facts about people, their attributes, preferences, or states.
    - Include: subject, predicate, object
@@ -28,6 +30,7 @@ Conversation Text:
 Session Date: {session_date}
 
 Provide your extraction as a JSON object with "events", "facts", and "claims" arrays.
+If an event is extracted, prefer the `title` field over free-form `description`.
 """
 
 TOOLS_DESCRIPTION = """
@@ -123,9 +126,13 @@ Guidelines for answering:
 5. For opinion/preference questions, attribute statements to the correct speaker.
 6. If there are contradictions in the evidence, note them.
 
-Can you answer? Reply with:
-YES: <concise answer based on evidence>
-NO: <explain what information is still needed>
+Reply with valid JSON only in this schema:
+{{
+  "can_answer": true or false,
+  "answer": "concise grounded answer or empty string",
+  "confidence": "low" | "medium" | "high",
+  "missing": "what is still missing if can_answer is false"
+}}
 """
 
 MEMORY_CONSOLIDATION_SYSTEM = """You are a memory consolidation expert. Your task is to analyze extracted facts and events, identify duplicates or related information, and merge them into clean, canonical facts.

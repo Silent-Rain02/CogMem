@@ -211,7 +211,7 @@ class Indexer:
                         all_extraction_results.append(extraction_result)
                         # 记录 chunk 用于后续的向量化
                         chunk_id = f"chunk-{doc.id}-{_make_id(chunk_text)}"
-                        doc_chunks.append(Chunk(id=chunk_id, text=chunk_text[:500], doc_id=doc.id, turn_id=turn_id))
+                        doc_chunks.append(Chunk(id=chunk_id, text=chunk_text, doc_id=doc.id, turn_id=turn_id))
                     
                     # 合并所有chunks的提取结果
                     merged_result = {
@@ -256,7 +256,7 @@ class Indexer:
                         
                         # 记录 chunk 用于后续的向量化
                         chunk_id = f"chunk-{doc.id}-{_make_id(chunk_text)}"
-                        doc_chunks.append(Chunk(id=chunk_id, text=chunk_text[:500], doc_id=doc.id, turn_id=turn_id))
+                        doc_chunks.append(Chunk(id=chunk_id, text=chunk_text, doc_id=doc.id, turn_id=turn_id))
                     
                     # 合并所有chunks的提取结果
                     merged_result = {
@@ -310,25 +310,8 @@ class Indexer:
 
                 # PersonFacet 已废弃，不再创建
                 
-                # ===== 启用 EvidenceStore：为所有节点类型建立到chunks的映射 =====
-                # 为所有节点类型关联对应的chunk文本，以便后续可以回溯原文
-                for node in doc_nodes:
-                    node_id = node.id if hasattr(node, 'id') else None
-                    if not node_id:
-                        continue
-                    
-                    # 为每个chunk建立映射
-                    for chunk in doc_chunks:
-                        self._evidence.add_chunk_for_entity(node_id, chunk.text)
-                
-                # 额外：为Fact节点的subject_id也建立映射（因为subject_id通常是Person ID）
-                # 这样可以通过Person ID直接获取相关的Fact原文
-                for fact_node in facts:
-                    subject_id = fact_node.subject_id if hasattr(fact_node, 'subject_id') else None
-                    if subject_id and subject_id not in [n.id for n in doc_nodes if hasattr(n, 'id')]:
-                        # 如果subject_id不在当前文档的节点中，也建立映射
-                        for chunk in doc_chunks:
-                            self._evidence.add_chunk_for_entity(subject_id, chunk.text)
+                # 将证据绑定收紧到节点相关 chunk，避免整个 session 被粗暴挂到每个节点上。
+                self._attach_relevant_evidence_chunks(doc_nodes, doc_chunks)
 
                 return doc_nodes, doc_relations, doc_chunks
             except Exception as e:
@@ -789,7 +772,7 @@ class Indexer:
                 self._cogmem.save()
                 print(f"  [OK] 最终保存完成")
             except Exception as save_err:
-                print(f"  ⚠️  最终保存失败: {str(save_err)}")
+                print(f"  [WARN] 最终保存失败: {str(save_err)}")
                 # 不抛出异常，允许继续执行
 
     def _extract_structured_from_chunk(
@@ -834,13 +817,18 @@ class Indexer:
         # Parse JSON response (response is already a string)
         extraction_result = safe_json_loads(response)
 
-        # Post-process events: normalize relative time expressions
+        # Post-process events: align extraction schema and normalize relative time expressions.
         session_date = session_date or question_date_iso
         if extraction_result and isinstance(extraction_result, dict):
             events = extraction_result.get("events", [])
             normalized_events = []
             for event in events:
                 if isinstance(event, dict):
+                    title = event.get("title") or event.get("description") or event.get("name")
+                    if title and not event.get("title"):
+                        event["title"] = str(title).strip()
+                    if "concepts" not in event or not isinstance(event.get("concepts"), list):
+                        event["concepts"] = []
                     time_raw = event.get("time")
                     if time_raw and isinstance(time_raw, str):
                         # CRITICAL FIX: Preserve fuzzy time - if normalization returns None, keep raw time
@@ -857,6 +845,204 @@ class Indexer:
             extraction_result["events"] = normalized_events
 
         return extraction_result
+
+    def _normalize_evidence_token(self, token: str) -> str:
+        token = re.sub(r"[^a-z0-9]+", "", str(token or "").lower())
+        if len(token) > 5 and token.endswith("ing"):
+            token = token[:-3]
+        elif len(token) > 4 and token.endswith("ed"):
+            token = token[:-2]
+        elif len(token) > 4 and token.endswith("es"):
+            token = token[:-2]
+        elif len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+        return token
+
+    def _text_token_set(self, text: str) -> set[str]:
+        tokens = set()
+        for raw in re.findall(r"[A-Za-z0-9_]+", str(text or "").lower()):
+            normalized = self._normalize_evidence_token(raw)
+            if normalized and len(normalized) >= 3:
+                tokens.add(normalized)
+        return tokens
+
+    def _node_evidence_terms(
+        self,
+        node: Any,
+        person_name_map: Dict[str, str],
+        concept_name_map: Dict[str, str],
+    ) -> Dict[str, Any]:
+        if isinstance(node, Event):
+            participant_names = [person_name_map.get(pid, "") for pid in node.participants]
+            concept_names = [concept_name_map.get(cid, "") for cid in node.concepts]
+            text_fields = [node.title, node.description, node.content, node.time_start_raw, node.session_time]
+            core_text_fields = [node.title, node.description, node.content, node.time_start_raw]
+            return {
+                "phrases": [field for field in text_fields if field],
+                "tokens": self._text_token_set(" ".join(field for field in text_fields if field)),
+                "core_tokens": self._text_token_set(" ".join(field for field in core_text_fields if field)),
+                "participants": [name for name in participant_names if name],
+                "concepts": [name for name in concept_names if name],
+                "session_time": node.session_time or "",
+            }
+
+        if isinstance(node, Fact):
+            subject_name = person_name_map.get(node.subject_id, node.subject_id)
+            object_name = concept_name_map.get(node.object_id or "", node.object_id or "")
+            purpose_name = concept_name_map.get(node.purpose_id or "", node.purpose_id or "")
+            text_fields = [node.content, node.predicate, subject_name, object_name, purpose_name, node.session_time]
+            core_text_fields = [node.content, node.predicate, object_name, purpose_name]
+            return {
+                "phrases": [field for field in text_fields if field],
+                "tokens": self._text_token_set(" ".join(field for field in text_fields if field)),
+                "core_tokens": self._text_token_set(" ".join(field for field in core_text_fields if field)),
+                "participants": [subject_name] if subject_name else [],
+                "concepts": [name for name in [object_name, purpose_name] if name],
+                "session_time": node.session_time or "",
+            }
+
+        if isinstance(node, Claim):
+            source_name = person_name_map.get(node.source_id, node.source_id)
+            target_name = person_name_map.get(node.target_id, concept_name_map.get(node.target_id, node.target_id))
+            text_fields = [node.content, source_name, target_name, node.session_time]
+            return {
+                "phrases": [field for field in text_fields if field],
+                "tokens": self._text_token_set(" ".join(field for field in text_fields if field)),
+                "core_tokens": self._text_token_set(node.content),
+                "participants": [name for name in [source_name, target_name] if name],
+                "concepts": [],
+                "session_time": node.session_time or "",
+            }
+
+        if isinstance(node, Person):
+            person_name = node.canonical_name or node.content or ""
+            return {
+                "phrases": [person_name],
+                "tokens": self._text_token_set(person_name),
+                "core_tokens": self._text_token_set(person_name),
+                "participants": [person_name] if person_name else [],
+                "concepts": [],
+                "session_time": getattr(node, "session_time", "") or "",
+            }
+
+        if isinstance(node, Concept):
+            concept_name = node.name or node.content or ""
+            return {
+                "phrases": [concept_name],
+                "tokens": self._text_token_set(concept_name),
+                "core_tokens": self._text_token_set(concept_name),
+                "participants": [],
+                "concepts": [concept_name] if concept_name else [],
+                "session_time": "",
+            }
+
+        content = getattr(node, "content", "") or ""
+        return {
+            "phrases": [content] if content else [],
+            "tokens": self._text_token_set(content),
+            "core_tokens": self._text_token_set(content),
+            "participants": [],
+            "concepts": [],
+            "session_time": getattr(node, "session_time", "") or "",
+        }
+
+    def _score_chunk_for_node(
+        self,
+        node: Any,
+        chunk_text: str,
+        person_name_map: Dict[str, str],
+        concept_name_map: Dict[str, str],
+    ) -> float:
+        terms = self._node_evidence_terms(node, person_name_map, concept_name_map)
+        chunk_lower = str(chunk_text or "").lower()
+        chunk_tokens = self._text_token_set(chunk_text)
+        score = 0.0
+        lexical_score = 0.0
+
+        for phrase in terms["phrases"]:
+            phrase_lower = str(phrase).lower().strip()
+            if not phrase_lower:
+                continue
+            if len(phrase_lower) >= 12 and phrase_lower in chunk_lower:
+                lexical_score += 6.0
+
+        core_overlap = terms.get("core_tokens", set()) & chunk_tokens
+        lexical_score += min(len(core_overlap), 8) * 1.2
+        score += lexical_score
+
+        if lexical_score > 0 or isinstance(node, Person):
+            for participant in terms["participants"]:
+                participant_lower = str(participant).lower().strip()
+                if participant_lower and participant_lower in chunk_lower:
+                    score += 1.5
+
+            for concept in terms["concepts"]:
+                concept_lower = str(concept).lower().strip()
+                if concept_lower and concept_lower in chunk_lower:
+                    score += 1.5
+
+        node_session = terms["session_time"]
+        chunk_session = self._parse_session_date(chunk_text)
+        if lexical_score > 0 and node_session and chunk_session and node_session == chunk_session:
+            score += 3.0
+
+        if isinstance(node, Event):
+            if node.time_start_raw and str(node.time_start_raw).lower() in chunk_lower:
+                score += 3.0
+            if node.time_start and str(node.time_start) in chunk_lower:
+                score += 3.0
+
+        if isinstance(node, Fact) and node.predicate:
+            pred_tokens = self._text_token_set(node.predicate.replace("_", " "))
+            score += min(len(pred_tokens & chunk_tokens), 3) * 1.5
+
+        if isinstance(node, Claim) and node.content and str(node.content).lower() in chunk_lower:
+            score += 4.0
+
+        return score
+
+    def _attach_relevant_evidence_chunks(self, nodes: List[Any], doc_chunks: List[Chunk]) -> None:
+        person_name_map = {
+            node.id: node.canonical_name
+            for node in nodes
+            if isinstance(node, Person) and getattr(node, "canonical_name", "")
+        }
+        concept_name_map = {
+            node.id: node.name
+            for node in nodes
+            if isinstance(node, Concept) and getattr(node, "name", "")
+        }
+
+        for node in nodes:
+            node_id = node.id if hasattr(node, "id") else None
+            if not node_id:
+                continue
+
+            scored_chunks: List[Tuple[float, str]] = []
+            for chunk in doc_chunks:
+                score = self._score_chunk_for_node(node, chunk.text, person_name_map, concept_name_map)
+                if score > 0:
+                    scored_chunks.append((score, chunk.text))
+
+            scored_chunks.sort(key=lambda item: item[0], reverse=True)
+
+            selected: List[str] = []
+            for score, text in scored_chunks[:4]:
+                if score < 2.0:
+                    continue
+                if text not in selected:
+                    selected.append(text)
+
+            if not selected and isinstance(node, Person):
+                for chunk in doc_chunks:
+                    person_name = person_name_map.get(node_id, "")
+                    if person_name and person_name.lower() in chunk.text.lower() and chunk.text not in selected:
+                        selected.append(chunk.text)
+                    if len(selected) >= 3:
+                        break
+
+            for text in selected:
+                self._evidence.add_chunk_for_entity(node_id, text)
 
     @property
     def evidence(self) -> EvidenceStore:
@@ -953,7 +1139,7 @@ class Indexer:
                     return f"{year:04d}-{month:02d}-{day:02d}"
 
         except Exception as e:
-            print(f"⚠️  Failed to parse session date '{date_str}': {e}")
+            print(f"[WARN] Failed to parse session date '{date_str}': {e}")
 
         return None
 
@@ -1267,7 +1453,7 @@ class Indexer:
                     if predicate in ["has_name", "is_named"]:
                         resolved_speaker_name = candidate_name
                         if self._cfg.runtime.max_concurrency <= 1:
-                            print(f"  [Indexer] 🔍 Detected Speaker identity: '{resolved_speaker_name}' (from self-introduction: has_name)")
+                            print(f"  [Indexer] [INFO] Detected Speaker identity: '{resolved_speaker_name}' (from self-introduction: has_name)")
                         break
                     
                     # For "is_a", validate that it's a name (not occupation)
@@ -1281,7 +1467,7 @@ class Indexer:
                         if word_count <= 3:  # Reasonable name length
                             resolved_speaker_name = candidate_name
                             if self._cfg.runtime.max_concurrency <= 1:
-                                print(f"  [Indexer] 🔍 Detected Speaker identity: '{resolved_speaker_name}' (from self-introduction: is_a)")
+                                print(f"  [Indexer] [INFO] Detected Speaker identity: '{resolved_speaker_name}' (from self-introduction: is_a)")
                             break
         
         # If no self-introduction found, keep Speaker unresolved for this chunk
@@ -1376,7 +1562,7 @@ class Indexer:
                         unique_suffix = hashlib.md5(result_str.encode()).hexdigest()[:8]
                     person_id = f"p_{person_id_normalized}_{unique_suffix}"
                     if self._cfg.runtime.max_concurrency <= 1:
-                        print(f"  [Indexer] 🛡️ Isolated generic identity: '{canonical_name}' -> {person_id}")
+                        print(f"  [Indexer] [INFO] Isolated generic identity: '{canonical_name}' -> {person_id}")
                 else:
                     person_id = f"p_{person_id_normalized}"
 
@@ -1549,7 +1735,7 @@ class Indexer:
             # 检查事件是否完整：至少需要标题和至少一个参与者
             if not title or not participant_ids:
                 if self._cfg.runtime.max_concurrency <= 1:
-                    print(f"  [Indexer] ⚠️ 跳过不完整事件: title={title}, participants={len(participant_ids)}")
+                    print(f"  [Indexer] [WARN] 跳过不完整事件: title={title}, participants={len(participant_ids)}")
                 continue  # 跳过不完整的事件
             
             # P0 FIX 1.1: 时间信息验证和增强
@@ -1602,7 +1788,7 @@ class Indexer:
             # 验证事件节点是否满足基本要求
             if not event.title or not event.participants:
                 if self._cfg.runtime.max_concurrency <= 1:
-                    print(f"  [Indexer] ⚠️ 跳过无效事件节点: {event_id}")
+                    print(f"  [Indexer] [WARN] 跳过无效事件节点: {event_id}")
                 continue  # 跳过无效事件
             
             nodes_to_add.append(event)
@@ -1705,12 +1891,12 @@ class Indexer:
             # This prevents ValidationError and reduces error rate
             if object_id is None and purpose_id is None:
                 if getattr(self._cfg.extraction, 'skip_incomplete_facts', True):
-                    print(f"⚠️  Skipping incomplete fact: {subject} {predicate} (no object or purpose)")
+                    print(f"[WARN] Skipping incomplete fact: {subject} {predicate} (no object or purpose)")
                     continue
                 else:
                     # If configured to keep incomplete facts, set a default placeholder
                     # CRITICAL FIX: Use concept_manager.resolve() to get correct ID (c_unknown, not c_c_unknown)
-                    print(f"⚠️  Incomplete fact (no object/purpose): {subject} {predicate}. Adding placeholder.")
+                    print(f"[WARN] Incomplete fact (no object/purpose): {subject} {predicate}. Adding placeholder.")
                     object_id = self._concept_manager.resolve("unknown")  # Use concept_manager to avoid double prefix
 
             # Create Fact node

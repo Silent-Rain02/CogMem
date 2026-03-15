@@ -26,15 +26,13 @@ class EvidenceStore:
         chunks = self._entity_to_chunks.get(entity_id, [])
         if not chunks:
             return []
-
-        if limit < 12:
-            limit = 12
+        limit = max(1, int(limit))
 
         # Prefer ChunkStore global search then filter by entity (avoids re-embedding all entity chunks)
         if embedding_encoder and chunk_store and chunk_store.size() > 0:
             try:
                 query_embedding = embedding_encoder.encode([query])[0]
-                candidate_results = chunk_store.search(query_embedding, top_k=min(limit * 2, chunk_store.size()))
+                candidate_results = chunk_store.search(query_embedding, top_k=min(max(limit * 3, limit), chunk_store.size()))
                 entity_text_set = set(chunks)
                 sorted_chunks = []
                 for chunk, score in candidate_results:

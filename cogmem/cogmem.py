@@ -127,8 +127,8 @@ class CogMem:
         
         # 如果索引存在但维度不匹配，给出额外提示
         if index_dim is not None and index_dim != self.cfg.model.embedding_dim:
-            print(f"[CogMem] ⚠️  Index dimension ({index_dim}) differs from model dimension ({self.cfg.model.embedding_dim})")
-            print(f"[CogMem] ⚠️  The index will be incompatible. Consider rebuilding it.")
+            print(f"[CogMem] [WARN] Index dimension ({index_dim}) differs from model dimension ({self.cfg.model.embedding_dim})")
+            print(f"[CogMem] [WARN] The index will be incompatible. Consider rebuilding it.")
         
         # 使用TypedVectorStore（按节点类型分片，优化内存使用）
         self.vstore = TypedVectorStore(
@@ -594,11 +594,11 @@ class CogMem:
                 self.graph.export_json(graph_json_path, indent=2)
                 print(f"  - 导出知识图谱JSON: {graph_json_path}")
             except Exception as e:
-                print(f"  ⚠️  导出知识图谱JSON失败（不影响主流程）: {e}")
+                print(f"  [WARN] 导出知识图谱JSON失败（不影响主流程）: {e}")
             
-            print("[CogMem] ✓ 索引保存完成")
+            print("[CogMem] [OK] 索引保存完成")
         except Exception as e:
-            print(f"[CogMem] ✗ 保存失败: {str(e)}")
+            print(f"[CogMem] [ERROR] 保存失败: {str(e)}")
             import traceback
             traceback.print_exc()
             raise
@@ -634,7 +634,7 @@ class CogMem:
                 self.vstore.load(ipath, eidspath)
         except ValueError as e:
             # 维度不匹配错误
-            print(f"[CogMem] ❌ Failed to load index: {e}")
+            print(f"[CogMem] [ERROR] Failed to load index: {e}")
             print(f"[CogMem] The index dimension doesn't match the current embedding model.")
             print(f"[CogMem] Please rebuild the index or switch to the correct embedding model.")
             raise

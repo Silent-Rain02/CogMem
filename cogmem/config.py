@@ -27,7 +27,7 @@ class ModelConfig:
     modelscope_chat_model: Optional[str] = "qwen2.5-14b-instruct"  # ModelScope专用聊天模型
 
     # 嵌入模型配置
-    embedding_model: Optional[str] = None  # 通用嵌入模型
+    embedding_model: Optional[str] = "BAAI/bge-m3"  # 通用嵌入模型
     ollama_embedding_model: Optional[str] = "bge-m3"  # Ollama专用嵌入模型
     siliconflow_embedding_model: Optional[str] = "BAAI/bge-m3"  # SiliconFlow专用嵌入模型
     modelscope_embedding_model: Optional[str] = "bge-m3"  # ModelScope专用嵌入模型
@@ -89,56 +89,74 @@ class ExtractionConfig:
 QuestionType = Literal["single_hop", "multi_hop", "temporal", "open_domain", "adversarial"]
 
 def classify_question_type(query: str) -> QuestionType:
-    """Classify question type based on keywords and patterns (v3.3 Enhancement)
-    
-    This helps the SearchAgent choose optimal tool strategies.
-    
-    Returns:
-        QuestionType: One of "single_hop", "multi_hop", "temporal", "open_domain", "adversarial"
+    """Classify question type using soft evidence from question structure.
+
+    The goal is not to hard-route benchmark items, but to distinguish:
+    - direct grounded lookup (`single_hop`)
+    - shared / relational reasoning (`multi_hop`)
+    - time-conditioned reasoning (`temporal`)
+    - counterfactual / hypothesis / trait inference (`open_domain`)
+    - likely-unanswerable checks (`adversarial`)
     """
-    query_lower = query.lower()
-    
-    # Multi-hop indicators: questions involving multiple entities or relationships
+    query_lower = (query or "").strip().lower()
+    if not query_lower:
+        return "single_hop"
+
+    def _score(patterns: list[str]) -> int:
+        return sum(1 for pattern in patterns if re.search(pattern, query_lower))
+
     multi_hop_patterns = [
-        r'\b(both|common|shared|together|each other|relationship between)\b',
-        r'\b(\w+)\s+and\s+(\w+)\b.*\b(both|common|shared)\b',
-        r'\bwhat do .+ and .+ (have in common|share)\b',
+        r"\b(both|common|shared|together|each other|relationship between)\b",
+        r"\bwhat do .+ and .+ (have in common|share)\b",
+        r"\bhow are .+ and .+ related\b",
+        r"\bbetween .+ and .+\b",
     ]
-    for pattern in multi_hop_patterns:
-        if re.search(pattern, query_lower):
-            return "multi_hop"
-    
-    # Temporal indicators: questions about time
     temporal_patterns = [
-        r'\b(when|what time|what date|how long|how many (days|weeks|months|years))\b',
-        r'\b(before|after|during|since|until|ago)\b',
-        r'\b(first|last|recent|latest|earliest)\b',
-        r'\b\d{4}\b',  # Year mention
+        r"\b(when|what time|what date)\b",
+        r"\bhow long\b",
+        r"\bhow many (days|weeks|months|years|times)\b",
+        r"\b(before|after|during|since|until|ago)\b",
+        r"\b(first|last|recent|recently|latest|earliest|current|currently|soon)\b",
+        r"\b(yesterday|today|tomorrow|weekend|month|year|summer|spring|fall|winter)\b",
+        r"\b\d{4}\b",
     ]
-    temporal_count = sum(1 for p in temporal_patterns if re.search(p, query_lower))
-    if temporal_count >= 2:
-        return "temporal"
-    
-    # Adversarial indicators: questions that might have no answer or trick questions
     adversarial_patterns = [
-        r'\b(did .+ ever|has .+ ever|was there)\b.*\?',
-        r'\b(never|not|no)\b.*\b(mention|say|discuss)\b',
+        r"\b(did|has|was|were)\b.+\b(ever|at any point)\b",
+        r"\b(never|not|no)\b.+\b(mention|say|discuss|talk about)\b",
+        r"\b(is there any|was there any)\b",
     ]
-    for pattern in adversarial_patterns:
-        if re.search(pattern, query_lower):
-            return "adversarial"
-    
-    # Open domain indicators: questions requiring world knowledge or inference
-    open_domain_patterns = [
-        r'\b(would|could|might|should|likely|probably)\b',
-        r'\b(why|how does|what kind of|what type of)\b',
-        r'\b(opinion|think|feel|believe)\b',
+    inferential_patterns = [
+        r"\b(would|could|might|should|likely|probably)\b",
+        r"\b(why|what kind of|what type of|what personality|what political|what attributes)\b",
+        r"\b(opinion|think|feel|believe|describe|considered)\b",
     ]
-    for pattern in open_domain_patterns:
-        if re.search(pattern, query_lower):
-            return "open_domain"
-    
-    # Default: single-hop (direct fact lookup)
+    direct_lookup_patterns = [
+        r"\b(who|where|which|what)\b",
+        r"\b(has|have|did|does|is|are)\b",
+    ]
+
+    multi_hop_score = _score(multi_hop_patterns)
+    temporal_score = _score(temporal_patterns)
+    adversarial_score = _score(adversarial_patterns)
+    inferential_score = _score(inferential_patterns)
+    direct_score = _score(direct_lookup_patterns)
+
+    if multi_hop_score >= 1:
+        return "multi_hop"
+
+    if temporal_score >= 1:
+        return "temporal"
+
+    if adversarial_score >= 1 and inferential_score == 0:
+        return "adversarial"
+
+    # Counterfactual / hypothetical / trait attribution questions are open-domain,
+    # but modal verbs alone should not override stronger temporal evidence.
+    if inferential_score >= 2:
+        return "open_domain"
+    if inferential_score >= 1 and temporal_score == 0 and direct_score == 0:
+        return "open_domain"
+
     return "single_hop"
 
 @dataclass
@@ -228,7 +246,7 @@ class AgentConfig:
             "open_domain": {
                 "semantic_search_top_k": 6,
                 "max_iterations": 4,
-                "require_evidence_for_answer": False,  # 开放域可能需要推理
+                "require_evidence_for_answer": True,  # 推理类问题也需要明确证据支撑
             },
             "adversarial": {
                 "semantic_search_top_k": 5,

@@ -91,6 +91,7 @@ class SearchAgent:
         self._current_question_type: Optional[QuestionType] = None
         self._evidence_collected: bool = False  # Track if evidence has been collected
         self._current_query: str = ""  # 当前 run() 的 query，供 runtime trace 使用
+        self._last_tool_node_hits: Dict[str, List[str]] = {}
 
     def _apply_question_type_config(self, question_type: QuestionType) -> None:
         """Apply dynamic configuration based on question type (v3.3 Enhancement)"""
@@ -169,6 +170,118 @@ class SearchAgent:
             "auto_get_evidence": self.auto_get_evidence,
         }
 
+    def _current_routing_plan(self, routing_result: Any) -> Dict[str, Any]:
+        if routing_result is None:
+            return {}
+        output = getattr(routing_result, "output", {}) or {}
+        return output if isinstance(output, dict) else {}
+
+    def _format_anchor_seed(self, metadata: Dict[str, Any], node_id: str) -> str:
+        node_type = metadata.get("node_type")
+        if node_type == "person":
+            return f"Person: {metadata.get('canonical_name', node_id)}"
+        if node_type == "concept":
+            return f"Concept: {self._format_node_to_rich_text(metadata, node_id)}"
+        if node_type == "event":
+            title = metadata.get("title") or metadata.get("name") or node_id
+            return f"Event: {title}"
+        if node_type == "fact":
+            return f"Fact: {metadata.get('content') or metadata.get('description') or node_id}"
+        if node_type == "claim":
+            return f"Claim: {metadata.get('content') or metadata.get('description') or node_id}"
+        return self._format_node_to_rich_text(metadata, node_id)
+
+    def _has_substantive_retrieval(self, history: List[ThoughtActionObservation]) -> bool:
+        substantive_actions = {"semantic_search", "fact_lookup", "claim_lookup", "timeline_query", "find_common_ground"}
+        for step in history:
+            if step.action in substantive_actions:
+                return True
+        return False
+
+    def _remember_tool_hits(self, tool_name: str, node_ids: List[str]) -> None:
+        cleaned = []
+        for node_id in node_ids:
+            if node_id and node_id not in cleaned:
+                cleaned.append(node_id)
+        self._last_tool_node_hits[tool_name] = cleaned
+
+    def _select_evidence_target(self, anchor_results: List[Any], history: List[ThoughtActionObservation]) -> Optional[str]:
+        for step in reversed(history):
+            params = step.action_input or {}
+            if step.action in {"timeline_query", "semantic_search", "fact_lookup", "claim_lookup", "find_common_ground"}:
+                recent_hits = self._last_tool_node_hits.get(step.action, [])
+                if recent_hits:
+                    return recent_hits[0]
+            if step.action == "get_evidence" and params.get("entity_id"):
+                return params.get("entity_id")
+            if step.action == "fact_lookup":
+                subject_id = params.get("subject_id") or self._resolve_entity_id(params.get("subject", ""), types=["person"])
+                if subject_id:
+                    return subject_id
+            if step.action == "claim_lookup":
+                target_id = params.get("target_id") or self._resolve_entity_id(params.get("target", ""), types=["person", "concept"])
+                if target_id:
+                    return target_id
+            if step.action == "timeline_query":
+                entity_ids = params.get("entity_ids") or []
+                if entity_ids:
+                    return entity_ids[0]
+                if params.get("entity_id"):
+                    return params.get("entity_id")
+            if step.action == "find_common_ground":
+                entity_ids = params.get("entity_ids") or []
+                if entity_ids:
+                    return entity_ids[0]
+        if anchor_results:
+            return getattr(anchor_results[0], "node_id", None)
+        return None
+
+    def _build_seed_retrieval_plan(self, query: str, anchor_results: List[Any], routing_plan: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any], str]]:
+        person_ids = []
+        for anchor in anchor_results:
+            if getattr(anchor, "node_type", None) == "person" and anchor.node_id not in person_ids:
+                person_ids.append(anchor.node_id)
+
+        primary_action = routing_plan.get("primary_action") or "semantic_search"
+        semantic_node_types = routing_plan.get("semantic_node_types") or ["fact", "event"]
+
+        if primary_action == "find_common_ground" and len(person_ids) >= 2:
+            return (
+                "find_common_ground",
+                {"entity_ids": person_ids[:2], "node_types": routing_plan.get("node_types", ["concept", "event", "fact"])},
+                "Routing skill selected shared-grounding retrieval before answer synthesis.",
+            )
+
+        if primary_action == "timeline_query" and person_ids:
+            return (
+                "timeline_query",
+                {"entity_ids": person_ids[:1], "time_query": routing_plan.get("time_query", "")},
+                "Routing skill selected temporal retrieval conditioned on the question time expression.",
+            )
+
+        if primary_action == "claim_lookup" and person_ids:
+            params: Dict[str, Any] = {"target_id": person_ids[-1], "limit": 6}
+            if len(person_ids) >= 2:
+                params["source_id"] = person_ids[0]
+            return (
+                "claim_lookup",
+                params,
+                "Routing skill selected claim retrieval to gather speaker-attributed judgments.",
+            )
+
+        if primary_action == "fact_lookup" and person_ids:
+            return (
+                "fact_lookup",
+                {"subject_id": person_ids[0], "latest_only": False, "limit": 6, "query": query},
+                "Routing skill selected direct fact retrieval for grounded attribute lookup.",
+            )
+
+        return (
+            "semantic_search",
+            {"query": query, "node_types": semantic_node_types, "top_k": min(self.semantic_search_top_k, 6)},
+            "Routing skill selected query-conditioned semantic retrieval before answer synthesis.",
+        )
+
     def _suggest_tool_for_question(self, query: str, question_type: QuestionType) -> str:
         """Suggest optimal tool based on question type and patterns (v3.3 Enhancement)
         
@@ -218,7 +331,7 @@ class SearchAgent:
    - Use this first for "when", "before", "after", "during", or date/time questions.
    - Supports time values (e.g. 2023, 2023-05) and rough natural-language time phrases.
 
-4. fact_lookup(subject_id: str = "", subject: str = "", predicate: str = "", object_id: str = "", at_time: str = "", latest_only: bool = True)
+4. fact_lookup(subject_id: str = "", subject: str = "", predicate: str = "", object_id: str = "", at_time: str = "", latest_only: bool = False, query: str = "")
    - Directly retrieve Fact nodes for a person/concept pair.
    - Use this for preferences, habits, stable attributes, and "what does X like/do/use" questions.
 
@@ -242,6 +355,67 @@ class SearchAgent:
    - This is useful for verifying answers or getting more context about an entity.
 """
 
+    def _looks_like_tool_protocol(self, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        upper = stripped.upper()
+        return (
+            upper.startswith("TOOL:")
+            or upper.startswith("ARGS:")
+            or upper.startswith("FINAL_ANSWER:")
+            or upper.startswith("THOUGHT:")
+            or upper.startswith("ACTION:")
+            or upper.startswith("OBSERVATION:")
+        )
+
+    def _parse_step_response(self, response: str) -> Dict[str, Any]:
+        text = (response or "").strip()
+        if not text:
+            return {}
+
+        data = extract_json_from_markdown(text)
+        if not data:
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {}
+
+        if isinstance(data, dict) and data:
+            normalized = dict(data)
+            if "tool" in normalized and "action" not in normalized:
+                normalized["action"] = normalized.pop("tool")
+            if "args" in normalized and "params" not in normalized:
+                normalized["params"] = normalized.pop("args")
+            if "action_input" in normalized and "params" not in normalized:
+                normalized["params"] = normalized.pop("action_input")
+            return normalized
+
+        final_match = re.search(r"FINAL_ANSWER\s*:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+        if final_match:
+            return {"final_answer": final_match.group(1).strip()}
+
+        tool_match = re.search(r"TOOL\s*:\s*([A-Za-z_][A-Za-z0-9_]*)", text, re.IGNORECASE)
+        if not tool_match:
+            return {}
+
+        params: Dict[str, Any] = {}
+        args_match = re.search(r"ARGS\s*:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+        if args_match:
+            raw_args = args_match.group(1).strip()
+            params = extract_json_from_markdown(raw_args)
+            if not params:
+                try:
+                    params = json.loads(raw_args)
+                except Exception:
+                    params = {}
+
+        return {
+            "action": tool_match.group(1),
+            "params": params if isinstance(params, dict) else {},
+            "thought": "",
+        }
+
     def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
         """执行 ReAct 推理循环 (v3.3 Enhanced)
         
@@ -261,6 +435,7 @@ class SearchAgent:
             "common_ground_followup_used": False,
         }
         self._current_query = query
+        self._last_tool_node_hits = {}
 
         if self.skill_runtime is not None:
             self.skill_runtime.clear_trace()
@@ -270,6 +445,7 @@ class SearchAgent:
         self._current_question_type = classify_question_type(query)
         self._evidence_collected = False
         routing_result = self._run_skill("routing_skill")
+        routing_plan = self._current_routing_plan(routing_result)
         if routing_result is None or routing_result.triggered:
             self._apply_question_type_config(self._current_question_type)
         
@@ -290,22 +466,10 @@ class SearchAgent:
         readable_anchors = []
         for anchor in anchor_results:
             metadata = anchor.metadata or {}
-            # ROOT FIX: Explicitly handle Person enrichment for clear initial observation
-            if metadata.get("node_type") == "person":
-                person_info = [f"Person: {metadata.get('canonical_name', anchor.name)}"]
-                if metadata.get("known_facts"):
-                    person_info.append("Known Facts: " + metadata["known_facts"])
-                if metadata.get("event_previews"):
-                    person_info.append("Recent Event Previews: " + metadata["event_previews"] + " (Use timeline_query for details)")
-                readable_anchors.append(" | ".join(person_info))
-            elif metadata.get("node_type") == "concept":
-                # P0 FIX: 使用 _format_node_to_rich_text 确保 concept 名称转换为自然语言
-                concept_display = self._format_node_to_rich_text(metadata, anchor.node_id)
-                readable_anchors.append(f"{concept_display} (Entry point: use traverse_neighbors to find details)")
-            elif metadata.get("node_type") == "chunk":
+            if metadata.get("node_type") == "chunk":
                 readable_anchors.append(f"Raw Chunk: {metadata.get('text', 'unknown')[:300]}...")
             else:
-                readable_anchors.append(self._format_node_to_rich_text(metadata, anchor.node_id))
+                readable_anchors.append(self._format_anchor_seed(metadata, anchor.node_id))
 
         obs_str = "\n".join(readable_anchors) if readable_anchors else "No anchors found"
         step_counter += 1
@@ -327,6 +491,27 @@ class SearchAgent:
         if early_result is not None:
             return early_result
 
+        seed_plan = self._build_seed_retrieval_plan(query, anchor_results, routing_plan)
+        if seed_plan is not None:
+            seed_action, seed_params, seed_thought = seed_plan
+            if verbose:
+                print(f"[SearchAgent] Seed retrieval via {seed_action}: {seed_params}")
+            seed_obs = self._execute_tool(seed_action, seed_params)
+            if seed_action == "get_evidence":
+                self._evidence_collected = True
+            step_counter, early_result = self._record_and_maybe_finalize(
+                query=query,
+                history=local_history,
+                scratchpad=step_scratchpad,
+                step_counter=step_counter,
+                thought=seed_thought,
+                action=seed_action,
+                action_input=seed_params,
+                observation=seed_obs,
+            )
+            if early_result is not None:
+                return early_result
+
         # Question-type-specific budgets are already applied in _apply_question_type_config().
         effective_max_iterations = max(1, int(self.max_iterations))
         
@@ -334,8 +519,9 @@ class SearchAgent:
             history_str = "\n".join(step_scratchpad)
             # v3.3: 使用动态的最大迭代次数
             user_msg = SEARCH_AGENT_STEP_PROMPT.format(
-                question=query, current_round=round_idx, max_rounds=effective_max_iterations,
-                anchors=anchors_json, agent_scratchpad=history_str
+                query=query,
+                history=history_str,
+                tools=self._get_tools_description()
             )
 
             if verbose:
@@ -346,12 +532,7 @@ class SearchAgent:
             if verbose:
                 print(f"\n[Round {round_idx}] Response:\n{resp}")
 
-            data = extract_json_from_markdown(resp)
-            if not data:
-                try: 
-                    data = json.loads(resp)
-                except: 
-                    data = {}
+            data = self._parse_step_response(resp)
             if "final_answer" in data:
                 injected_result = self._maybe_inject_required_shared_evidence(
                     query=query,
@@ -374,10 +555,10 @@ class SearchAgent:
                         
                         # Try to get evidence for the first anchor
                         if anchor_results:
-                            first_anchor_id = anchor_results[0].node_id
+                            first_anchor_id = self._select_evidence_target(anchor_results, local_history)
                             evidence_result = self._run_skill("evidence_retrieval_skill")
-                            if evidence_result is None or evidence_result.triggered:
-                                evidence_obs = self._execute_tool("get_evidence", {"entity_id": first_anchor_id, "limit": 3})
+                            if first_anchor_id and (evidence_result is None or evidence_result.triggered):
+                                evidence_obs = self._execute_tool("get_evidence", {"entity_id": first_anchor_id, "limit": 3, "query": query})
                                 step_counter += 1
                                 local_history.append(ThoughtActionObservation(
                                     step=step_counter,
@@ -475,7 +656,7 @@ class SearchAgent:
                     return early_result
             else:
                 # 容错：如果 LLM 没有返回 JSON 格式但看起来像是答案
-                if round_idx > 2: 
+                if round_idx > 2 and not self._looks_like_tool_protocol(resp):
                     ans = extract_clean_answer(resp, query)
                     if ans:
                         return self._return_run_result(local_history, ans, "low")
@@ -493,13 +674,15 @@ class SearchAgent:
                 
                 # Try to get evidence for the first anchor or most relevant node
                 if anchor_results:
-                    first_anchor_id = anchor_results[0].node_id
+                    first_anchor_id = self._select_evidence_target(anchor_results, local_history)
                     try:
                         evidence_result = self._run_skill("evidence_retrieval_skill")
-                        if evidence_result is not None and not evidence_result.triggered:
+                        if not first_anchor_id:
+                            evidence_obs = ""
+                        elif evidence_result is not None and not evidence_result.triggered:
                             evidence_obs = "Skill Disabled: evidence_retrieval_skill"
                         else:
-                            evidence_obs = self._execute_tool("get_evidence", {"entity_id": first_anchor_id, "limit": 3})
+                            evidence_obs = self._execute_tool("get_evidence", {"entity_id": first_anchor_id, "limit": 3, "query": query})
                         if evidence_obs and "No original text evidence found" not in evidence_obs and "Skill Disabled:" not in evidence_obs:
                             step_counter += 1
                             local_history.append(ThoughtActionObservation(
@@ -520,10 +703,14 @@ class SearchAgent:
         final_fallback_answer, final_confidence = self._postprocess_final_answer(
             query, final_fallback_answer, "low", local_history
         )
+        if not self._has_substantive_retrieval(local_history):
+            final_fallback_answer = ""
+        elif self._looks_like_tool_protocol(final_fallback_answer):
+            final_fallback_answer = ""
         
         return self._return_run_result(
             local_history,
-            final_fallback_answer or "Reasoning limit reached without final answer.",
+            final_fallback_answer or "I don't have enough information.",
             final_confidence,
         )
 
@@ -978,6 +1165,11 @@ class SearchAgent:
                 skill_result = self.skill_runtime.execute_skill(skill_name, ctx)
                 if not skill_result.triggered:
                     return f"Skill Disabled: {skill_name}"
+                skill_output = getattr(skill_result, "output", {}) or {}
+                if name == "get_evidence" and skill_output.get("query_conditioned") and not params.get("query"):
+                    params = {**params, "query": self._current_query}
+                if name == "timeline_query" and skill_output.get("time_query") and not params.get("time_query"):
+                    params = {**params, "time_query": skill_output.get("time_query")}
             result = self.skill_runtime.execute_tool(name, params, context=ctx, skill_name=skill_name)
             return result.summary
         try:
@@ -1020,6 +1212,8 @@ class SearchAgent:
         if not history:
             return False
         if action not in {"semantic_search", "claim_lookup", "fact_lookup", "timeline_query", "find_common_ground", "get_evidence"}:
+            return False
+        if action == "get_evidence" and not self._has_substantive_retrieval(history[:-1]):
             return False
         latest_obs = (history[-1].observation or "").strip()
         if not latest_obs:
@@ -1074,12 +1268,14 @@ class SearchAgent:
         question: str,
         history: List[ThoughtActionObservation],
     ) -> Optional[tuple[str, str]]:
+        if not self._has_substantive_retrieval(history):
+            return None
         evidence = self._build_synthesis_evidence(history)
         if not evidence:
             return None
         try:
             user_prompt = SEARCH_AGENT_CAN_ANSWER_PROMPT.format(
-                question=question,
+                query=question,
                 evidence=evidence,
             )
             resp = self.llm.chat(
@@ -1088,7 +1284,16 @@ class SearchAgent:
             )
             data = extract_json_from_markdown(resp)
             if not data:
-                data = json.loads(resp)
+                try:
+                    data = json.loads(resp)
+                except Exception:
+                    data = {}
+            if not data and isinstance(resp, str):
+                stripped = resp.strip()
+                if stripped.upper().startswith("YES:"):
+                    data = {"can_answer": True, "answer": stripped.split(":", 1)[1].strip(), "confidence": "medium"}
+                elif stripped.upper().startswith("NO:"):
+                    data = {"can_answer": False, "missing": stripped.split(":", 1)[1].strip()}
         except Exception:
             return None
         if not isinstance(data, dict):
@@ -1151,6 +1356,10 @@ class SearchAgent:
         """Normalize natural-language time expressions into a compact query string."""
         if not time_query:
             return ""
+        lowered = time_query.lower()
+        for season in ("spring", "summer", "fall", "autumn", "winter"):
+            if season in lowered:
+                return "fall" if season == "autumn" else season
         try:
             from cogmem.utils.temporal_parser import normalize_time_format, parse_relative_time
             normalized = normalize_time_format(time_query)
@@ -1238,12 +1447,15 @@ class SearchAgent:
             if importance is not None and isinstance(importance, (int, float)):
                 score = score * (0.7 + 0.3 * min(1.0, max(0.0, float(importance))))
             node_text = self._format_node_to_rich_text(node_data, node_id)
-            results_by_type[node_type].append((score, node_text))
+            results_by_type[node_type].append((score, node_text, node_id))
 
         results = []
+        hit_ids = []
         for nt in node_types:
-            for score, node_text in results_by_type.get(nt, []):
-                results.append(f"[Score: {score:.3f}] {node_text}")
+            for score, node_text, node_id in results_by_type.get(nt, []):
+                results.append(f"[Score: {score:.3f}] [ID: {node_id}] {node_text}")
+                if node_id not in hit_ids:
+                    hit_ids.append(node_id)
                 if len(results) >= top_k:
                     break
             if len(results) >= top_k:
@@ -1251,6 +1463,7 @@ class SearchAgent:
 
         if not results:
             return "No semantically similar nodes found."
+        self._remember_tool_hits("semantic_search", hit_ids)
 
         return f"Semantic Search Results ({len(results)} nodes):\n" + "\n".join(results)
 
@@ -1272,6 +1485,43 @@ class SearchAgent:
     
     def _tool_scan_timeline(self, entity_ids: List[str], time_query: str = "") -> str:
         """扫描时间线（内部方法，由 traverse_neighbors 调用）"""
+        season_months = {
+            "spring": {3, 4, 5},
+            "summer": {6, 7, 8},
+            "fall": {9, 10, 11},
+            "winter": {12, 1, 2},
+        }
+
+        def _extract_month(value: str) -> Optional[int]:
+            if not value:
+                return None
+            match = re.search(r"(\d{4})-(\d{2})", str(value))
+            if match:
+                try:
+                    month = int(match.group(2))
+                    if 1 <= month <= 12:
+                        return month
+                except ValueError:
+                    return None
+            return None
+
+        def _matches_season(item: Dict[str, Any], season: str) -> bool:
+            season = "fall" if season == "autumn" else season
+            months = season_months.get(season, set())
+            haystack = " ".join([
+                str(item.get("title", "")),
+                str(item.get("description", "")),
+                str(item.get("content", "")),
+                str(item.get("time_start_raw", "")),
+            ]).lower()
+            if season in haystack:
+                return True
+            for field_name in ("time_start", "time_resolved", "session_time"):
+                month = _extract_month(str(item.get(field_name, "")))
+                if month in months:
+                    return True
+            return False
+
         # 1. 获取所有关联事件
         person_results = self.graph_service.traverse_associations(
             entity_ids, 
@@ -1281,11 +1531,14 @@ class SearchAgent:
         
         events = []
         seen_ids = set()
+        focus_terms = self._extract_focus_terms(self._current_query or "")
         for r in person_results:
             if r.target_node and r.target_node.get("node_type") == "event":
                 event_id = r.target_id
                 if event_id not in seen_ids:
-                    events.append(r.target_node)
+                    event_payload = dict(r.target_node)
+                    event_payload["id"] = event_id
+                    events.append(event_payload)
                     seen_ids.add(event_id)
         
         # 2. 如果直接提供了 Event ID，也加入
@@ -1293,13 +1546,16 @@ class SearchAgent:
             if eid.startswith("event_") and eid not in seen_ids:
                 node = self.graph_service.graph_store.get_node(eid)
                 if node:
-                    events.append(node)
+                    event_payload = dict(node)
+                    event_payload["id"] = eid
+                    events.append(event_payload)
                     seen_ids.add(eid)
         
         # 3. 时间过滤（P0 FIX: 区分语义查询和时间值查询）
         time_query_lower = time_query.lower().strip()
         if time_query_lower and time_query_lower != "*":
             filtered_events = []
+            is_season_query = time_query_lower in season_months
             
             # 判断time_query是语义查询还是时间值
             # 时间值格式：YYYY, YYYY-MM, YYYY-MM-DD
@@ -1307,7 +1563,9 @@ class SearchAgent:
             
             for e in events:
                 match = False
-                if is_time_value:
+                if is_season_query:
+                    match = _matches_season(e, time_query_lower)
+                elif is_time_value:
                     # 时间值查询：在时间字段中搜索
                     t_start = str(e.get("time_start", "")).lower()
                     t_raw = str(e.get("time_start_raw", "")).lower()
@@ -1331,17 +1589,83 @@ class SearchAgent:
                 if match:
                     filtered_events.append(e)
             events = filtered_events
-        
-        # 4. 排序（优先使用 time_start，如果没有则使用 session_time）
-        def get_time_key(e):
-            return e.get("time_start") or e.get("time_start_raw") or e.get("session_time") or ""
-        
-        events.sort(key=get_time_key)
+
+        def _timeline_score(item: Dict[str, Any]) -> float:
+            haystack = " ".join([
+                str(item.get("title", "")),
+                str(item.get("description", "")),
+                str(item.get("content", "")),
+                str(item.get("time_start_raw", "")),
+                str(item.get("session_time", "")),
+            ]).lower()
+            score = 0.0
+            for term in focus_terms:
+                if term in haystack:
+                    score += 2.0
+            if time_query_lower in season_months and _matches_season(item, time_query_lower):
+                score += 3.0
+            elif time_query_lower and time_query_lower in haystack:
+                score += 2.5
+            if item.get("time_start"):
+                score += 1.0
+            return score
+
+        if events:
+            # Keep query-conditioned ranking as the primary order signal.
+            events.sort(
+                key=lambda item: (
+                    _timeline_score(item),
+                    str(item.get("time_start") or item.get("time_start_raw") or item.get("session_time") or ""),
+                ),
+                reverse=True,
+            )
         
         if not events:
+            # Fallback: scan fact nodes with temporal metadata when event nodes are sparse.
+            fact_matches = []
+            graph = self.graph_service.graph_store._g
+            for node_id, raw_node in graph.nodes(data=True):
+                node_data = self.graph_service.graph_store.get_node(node_id) or raw_node
+                if not node_data or node_data.get("node_type") != "fact":
+                    continue
+                if node_data.get("subject_id") not in entity_ids:
+                    continue
+                content = str(node_data.get("content", "")).lower()
+                if focus_terms and not any(term in content for term in focus_terms):
+                    session = str(node_data.get("session_time", "")).lower()
+                    if not any(term in session for term in focus_terms):
+                        continue
+                if time_query_lower and time_query_lower != "*" and time_query_lower not in content:
+                    session = str(node_data.get("session_time", "")).lower()
+                    if time_query_lower not in session:
+                        continue
+                fact_matches.append({**node_data, "id": node_data.get("id") or node_id})
+            fact_matches.sort(
+                key=lambda item: (
+                    sum(2.0 for term in focus_terms if term in str(item.get("content", "")).lower()),
+                    str(item.get("session_time", "")),
+                ),
+                reverse=True,
+            )
+            if fact_matches:
+                hit_ids = [item["id"] for item in fact_matches[:self.traverse_neighbors_max_results]]
+                self._remember_tool_hits("timeline_query", hit_ids)
+                lines = [
+                    f"{idx}. [ID: {item['id']}] Fact: {item.get('content', '')} | Session: {item.get('session_time', '')}"
+                    for idx, item in enumerate(fact_matches[:self.traverse_neighbors_max_results], start=1)
+                ]
+                return f"Timeline Fact Fallback ({len(lines)} items):\n" + "\n".join(lines)
             return f"No events found for {entity_ids} matching query '{time_query}'"
-        
-        return f"Timeline ({len(events)} events):\n" + "\n".join([f"{i+1}. {self._format_node_to_rich_text(e)}" for i, e in enumerate(events[:self.traverse_neighbors_max_results])])
+
+        hit_ids = []
+        formatted_lines = []
+        for idx, event in enumerate(events[:self.traverse_neighbors_max_results], start=1):
+            event_id = event.get("id") or event.get("node_id")
+            if event_id and event_id not in hit_ids:
+                hit_ids.append(event_id)
+            formatted_lines.append(f"{idx}. [ID: {event_id}] {self._format_node_to_rich_text(event, event_id)}")
+        self._remember_tool_hits("timeline_query", hit_ids)
+        return f"Timeline ({len(formatted_lines)} events):\n" + "\n".join(formatted_lines)
 
     def _tool_timeline_query(self, entity_ids: List[str] = None, entity_id: str = "", entity_queries: List[str] = None, relation_types: List[str] = None, time_query: str = "") -> str:
         """Explicit timeline query tool for temporal recall."""
@@ -1361,12 +1685,14 @@ class SearchAgent:
         normalized_time_query = self._normalize_tool_time_query(time_query)
         return self._tool_scan_timeline(deduped_ids, normalized_time_query)
 
-    def _tool_fact_lookup(self, subject_id: str = "", subject: str = "", predicate: str = "", object_id: str = "", at_time: str = "", latest_only: bool = True, limit: int = 8) -> str:
+    def _tool_fact_lookup(self, subject_id: str = "", subject: str = "", predicate: str = "", object_id: str = "", at_time: str = "", latest_only: bool = False, limit: int = 8, query: str = "") -> str:
         """Direct fact lookup for a subject, optional predicate/object/time filtering."""
         resolved_subject_id = subject_id or self._resolve_entity_id(subject, types=["person"])
         if not resolved_subject_id:
             return "No subject found for fact_lookup."
         normalized_time = self._normalize_tool_time_query(at_time)
+        effective_query = (query or self._current_query or "").strip()
+        focus_terms = self._extract_focus_terms(effective_query)
         results = []
         graph = self.graph_service.graph_store._g
         if hasattr(graph, "nodes"):
@@ -1389,11 +1715,30 @@ class SearchAgent:
                     valid_to = str(node_data.get("valid_to", "") or valid_from)
                     if valid_from and valid_to and not (valid_from <= normalized_time <= valid_to):
                         continue
-                results.append({**node_data, "id": node_data.get("id") or node_id})
+                item = {**node_data, "id": node_data.get("id") or node_id}
+                haystack = " ".join([
+                    str(item.get("content", "")),
+                    str(item.get("predicate", "")),
+                    str(item.get("object_id", "")),
+                    str(item.get("purpose_id", "")),
+                ]).lower()
+                query_score = 0.0
+                for term in focus_terms:
+                    if term in haystack:
+                        query_score += 2.0
+                if predicate and predicate.lower() in str(item.get("predicate", "")).lower():
+                    query_score += 3.0
+                if normalized_time and normalized_time in str(item.get("session_time", "")):
+                    query_score += 2.5
+                if item.get("is_latest") is not False:
+                    query_score += 0.25
+                item["_query_score"] = query_score
+                results.append(item)
         if not results:
             return f"No facts found for {resolved_subject_id}."
         results.sort(
             key=lambda item: (
+                item.get("_query_score", 0.0),
                 item.get("is_latest") is not False,
                 item.get("valid_to") or item.get("session_time") or "",
                 item.get("confidence", 0.0),
@@ -1401,13 +1746,16 @@ class SearchAgent:
             reverse=True,
         )
         lines = []
+        hit_ids = []
         for idx, item in enumerate(results[:limit], start=1):
             validity = ""
             if item.get("valid_from") or item.get("valid_to"):
                 validity = f" | Valid: {item.get('valid_from') or '?'} -> {item.get('valid_to') or 'ongoing'}"
             elif item.get("session_time"):
                 validity = f" | Session: {item.get('session_time')}"
-            lines.append(f"{idx}. {self._format_node_to_rich_text(item, item.get('id'))}{validity}")
+            lines.append(f"{idx}. [ID: {item.get('id')}] {self._format_node_to_rich_text(item, item.get('id'))}{validity}")
+            hit_ids.append(item.get("id"))
+        self._remember_tool_hits("fact_lookup", hit_ids)
         return f"Fact Lookup Results ({len(results[:limit])} facts):\n" + "\n".join(lines)
 
     def _tool_claim_lookup(self, target_id: str = "", target: str = "", source_id: str = "", source: str = "", sentiment: str = "", limit: int = 8) -> str:
@@ -1424,6 +1772,7 @@ class SearchAgent:
         if not claims:
             return "No claims found."
         lines = []
+        hit_ids = []
         for idx, claim in enumerate(claims[:limit], start=1):
             source_name = claim.get("source_id", "").replace("p_", "").replace("_", " ")
             target_name = claim.get("target_id", "").replace("p_", "").replace("c_", "").replace("_", " ")
@@ -1431,7 +1780,11 @@ class SearchAgent:
             meta = f" | Sentiment: {claim.get('sentiment', 'unknown')}"
             if session_time:
                 meta += f" | Session: {session_time}"
-            lines.append(f"{idx}. Claim: {source_name} about {target_name}: {claim.get('content', '')}{meta}")
+            claim_id = claim.get("id", "")
+            lines.append(f"{idx}. [ID: {claim_id}] Claim: {source_name} about {target_name}: {claim.get('content', '')}{meta}")
+            if claim_id:
+                hit_ids.append(claim_id)
+        self._remember_tool_hits("claim_lookup", hit_ids)
         return f"Claim Lookup Results ({len(claims[:limit])} claims):\n" + "\n".join(lines)
 
     def _tool_find_common_ground(self, entity_ids: List[str], node_types: List[str] = ["concept", "event"]) -> str:
@@ -1640,6 +1993,11 @@ class SearchAgent:
             return True
         lowered = answer.lower()
         markers = [
+            "thought:",
+            "action:",
+            "observation:",
+            "tool:",
+            "args:",
             "not enough evidence",
             "there is no specific",
             "semantic search results",
@@ -1647,8 +2005,29 @@ class SearchAgent:
             "common nodes found",
             "reasoning limit reached",
             "no common ground found",
+            "timeline (",
+            "supporting evidence:",
         ]
         return any(marker in lowered for marker in markers)
+
+    def _sanitize_final_answer_candidate(self, answer: str) -> str:
+        candidate = (answer or "").strip()
+        if not candidate:
+            return ""
+
+        candidate = re.sub(r"^FINAL_ANSWER\s*:\s*", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\n+Supporting evidence:.*$", "", candidate, flags=re.IGNORECASE | re.DOTALL).strip()
+
+        if self._looks_like_tool_protocol(candidate):
+            return ""
+
+        if re.match(r"^(Thought|Action|ARGS|Observation)\s*:", candidate, flags=re.IGNORECASE):
+            return ""
+
+        if candidate.startswith("Timeline (") or candidate.startswith("Semantic Search Results"):
+            return ""
+
+        return candidate
 
     def _has_contradictory_shared_claim(self, answer: str) -> bool:
         lowered = (answer or "").lower()
@@ -1796,7 +2175,7 @@ class SearchAgent:
         confidence: str,
         history: List[ThoughtActionObservation],
     ) -> tuple[str, str]:
-        candidate = answer
+        candidate = self._sanitize_final_answer_candidate(answer)
         updated_confidence = confidence
 
         synthesized = self._synthesize_answer_with_llm(query, candidate, history)
@@ -1826,6 +2205,7 @@ class SearchAgent:
             candidate = claim_ans
             updated_confidence = "medium"
 
+        candidate = self._sanitize_final_answer_candidate(candidate)
         return candidate, updated_confidence
 
     def _build_synthesis_evidence_package(self, history: List[ThoughtActionObservation], max_items: int = 5) -> Dict[str, Any]:
@@ -1854,6 +2234,8 @@ class SearchAgent:
             if len(ranked_steps) >= max_items:
                 break
 
+        if not ranked_steps:
+            ranked_steps = [step for step in history if step.action != "find_anchors"][-max_items:]
         if not ranked_steps:
             ranked_steps = history[-max_items:]
 
@@ -1921,10 +2303,16 @@ class SearchAgent:
         if not observation:
             return ""
 
+        def _extract_inline_id(text: str) -> tuple[str, str]:
+            match = re.search(r"\[ID:\s*([^\]]+)\]\s*(.+)$", text)
+            if not match:
+                return "", text
+            return match.group(1).strip(), match.group(2).strip()
+
         if action == "claim_lookup":
             claims = []
             pattern = re.compile(
-                r"^\d+\.\s+Claim:\s+(?P<source>.+?)\s+about\s+(?P<target>.+?):\s+(?P<content>.+?)(?:\s+\|\s+Sentiment:\s+(?P<sentiment>\w+))?(?:\s+\|\s+Session:\s+(?P<session>.+))?$",
+                r"^\d+\.\s+(?:\[ID:\s*(?P<id>[^\]]+)\]\s+)?Claim:\s+(?P<source>.+?)\s+about\s+(?P<target>.+?):\s+(?P<content>.+?)(?:\s+\|\s+Sentiment:\s+(?P<sentiment>\w+))?(?:\s+\|\s+Session:\s+(?P<session>.+))?$",
                 re.IGNORECASE,
             )
             for line in observation.splitlines():
@@ -1932,6 +2320,7 @@ class SearchAgent:
                 if not match:
                     continue
                 claims.append({
+                    "id": (match.group("id") or "").strip(),
                     "source": match.group("source").strip(),
                     "target": match.group("target").strip(),
                     "content": match.group("content").strip(),
@@ -1943,7 +2332,7 @@ class SearchAgent:
         if action == "semantic_search":
             items = []
             pattern = re.compile(
-                r"^\[Score:\s*(?P<score>[0-9.]+)\]\s+(?P<content>.+)$",
+                r"^\[Score:\s*(?P<score>[0-9.]+)\]\s+(?:\[ID:\s*(?P<id>[^\]]+)\]\s+)?(?P<content>.+)$",
                 re.IGNORECASE,
             )
             for line in observation.splitlines():
@@ -1953,6 +2342,7 @@ class SearchAgent:
                 content = match.group("content").strip()
                 item_type = content.split(":", 1)[0].strip() if ":" in content else "unknown"
                 items.append({
+                    "id": (match.group("id") or "").strip(),
                     "score": float(match.group("score")),
                     "item_type": item_type,
                     "content": content,
@@ -1967,14 +2357,28 @@ class SearchAgent:
                     items.append(stripped[2:])
             return {"type": "common_ground", "items": items or observation[:1800]}
 
-        if action in {"timeline_query", "fact_lookup", "find_anchors"}:
+        if action == "find_anchors":
+            items = []
+            for line in observation.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("HINT:"):
+                    continue
+                prefix = stripped.split(":", 1)[0] if ":" in stripped else ""
+                if prefix in {"Person", "Concept", "Event", "Fact", "Claim"}:
+                    items.append(stripped)
+            return {"type": action, "items": items[:8] or observation[:400]}
+
+        if action in {"timeline_query", "fact_lookup"}:
             items = []
             for line in observation.splitlines():
                 stripped = line.strip()
                 if re.match(r"^\d+\.\s+", stripped):
-                    items.append(re.sub(r"^\d+\.\s+", "", stripped))
+                    entry = re.sub(r"^\d+\.\s+", "", stripped)
+                    node_id, content = _extract_inline_id(entry)
+                    items.append({"id": node_id, "content": content})
                 elif stripped and not stripped.endswith(":") and "Results" not in stripped and "Timeline (" not in stripped:
-                    items.append(stripped)
+                    node_id, content = _extract_inline_id(stripped)
+                    items.append({"id": node_id, "content": content})
             return {"type": action, "items": items[:12] or observation[:1800]}
 
         if action == "get_evidence":
@@ -1983,7 +2387,32 @@ class SearchAgent:
             for line in observation.splitlines():
                 match = pattern.match(line.strip())
                 if match:
-                    items.append(match.group("content").strip())
+                    content = match.group("content").strip()
+                    session_match = re.search(r"\[Session Date:\s*([^\]]+)\]", content, re.IGNORECASE)
+                    session_date = ""
+                    normalized_time = ""
+                    relative_hint = ""
+                    if session_match:
+                        raw_session = session_match.group(1).strip()
+                        session_date = self._normalize_tool_time_query(raw_session.split(" on ")[-1] if " on " in raw_session else raw_session)
+                        relative_match = re.search(
+                            r"\b(yesterday|today|tomorrow|last\s+\w+|next\s+\w+|two\s+\w+\s+ago|\w+\s+ago)\b",
+                            content,
+                            re.IGNORECASE,
+                        )
+                        if relative_match and session_date:
+                            relative_hint = relative_match.group(1).strip()
+                            try:
+                                from cogmem.memory.indexer import _resolve_relative_time
+                                normalized_time = _resolve_relative_time(relative_hint, session_date) or ""
+                            except Exception:
+                                normalized_time = ""
+                    items.append({
+                        "session_date": session_date,
+                        "relative_time": relative_hint,
+                        "normalized_time": normalized_time,
+                        "content": content,
+                    })
             return {"type": "evidence_chunks", "items": items[:6] or observation[:1800]}
 
         return {"type": action, "text": observation[:1800]}
@@ -2264,7 +2693,16 @@ class SearchAgent:
                         all_chunks = []
                         for event_id in supporting_event_ids[:limit]:  # Limit to top N events
                             try:
-                                event_chunks = self.evidence_store.get_chunks(event_id, limit=2)
+                                if query:
+                                    event_chunks = self.evidence_store.get_chunks_by_query(
+                                        event_id,
+                                        query,
+                                        limit=2,
+                                        embedding_encoder=self.graph_service.embedding_encoder if hasattr(self.graph_service, "embedding_encoder") else None,
+                                        chunk_store=self.graph_service.chunk_store if hasattr(self.graph_service, "chunk_store") else None,
+                                    )
+                                else:
+                                    event_chunks = self.evidence_store.get_chunks(event_id, limit=2)
                                 if event_chunks:
                                     all_chunks.extend(event_chunks)
                             except:
