@@ -18,8 +18,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-# Prefer the colocated LoCoMo runner over the legacy root-level script with
-# the same module name. This makes direct execution deterministic.
+# Prefer the colocated LoCoMo runner when this script is executed directly.
 if SCRIPTS_DIR in sys.path:
     sys.path.remove(SCRIPTS_DIR)
 sys.path.insert(0, SCRIPTS_DIR)

@@ -60,7 +60,7 @@ locomo10.json (列表，10个元素)
 
 ### ⚠️ 注意：参数含义不一致
 
-在 `eval_locomo_complete.py` 中：
+在 `scripts/eval_locomo_complete.py` 中：
 1. `load_locomo_dataset(args.data_dir)` - 没有传递 `max_samples`，会加载所有10个Conversation，包含1986个问题
 2. `comprehensive_evaluation(..., max_samples=args.max_samples)` - 限制的是问题数量
 
@@ -86,4 +86,3 @@ main()
 - **已索引文档数**：1283 个（对话文档，合并了多个turns）
 - **已索引实体数**：4544 个
 - **评测问题数**：如果使用默认值（None），会评测全部 1986 个问题
-
