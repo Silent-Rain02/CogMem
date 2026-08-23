@@ -86,7 +86,20 @@ The implementation detects the embedding dimension before creating its FAISS ind
 
 ## Reproducing the experiments
 
-CogMem includes runners for LoCoMo and LongMemEval. Exact dataset preparation, model settings, expected outputs, and the distinction between a smoke test and the full run are documented in [the reproducibility guide](docs/REPRODUCIBILITY.md).
+CogMem includes runners for LoCoMo and LongMemEval. The camera-ready setting uses BGE-M3 embeddings (1024 dimensions), temperature `0.0`, 15 anchors, traversal depth 2, up to 15 neighbors per hop, and at most 5 controller calls:
+
+```python
+from cogmem import CogMemConfig
+
+config = CogMemConfig()
+config.model.temperature = 0.0
+config.agent.find_anchors_top_k = 15
+config.agent.traverse_neighbors_max_depth = 2
+config.agent.traverse_neighbors_max_results = 15
+config.agent.max_iterations = 5
+```
+
+Download benchmark data from the official sources before running an evaluation: [LoCoMo paper](https://aclanthology.org/2024.acl-long.747/), [LoCoMo repository](https://github.com/snap-research/locomo), and [LongMemEval paper](https://openreview.net/forum?id=pZiyCaVuti). This repository does not distribute benchmark data.
 
 ```bash
 # LoCoMo: build the memory graph, consolidate it, and evaluate.
@@ -102,11 +115,11 @@ uv run python scripts/eval_longmemeval_complete.py \
   --output artifacts/longmemeval_results.json
 ```
 
-Benchmark data is not distributed with this repository. Download LoCoMo and LongMemEval from their official sources, then pass their paths to the runners. See [`datasets/README.md`](datasets/README.md).
+Start with a one-question LoCoMo smoke test before a full run by adding `--max_samples 1`. Exact outputs can vary with the model revision, provider/serving stack, dataset release, prompt, and judge configuration. Record the Git commit, dataset checksum, model identifiers, command, and full output JSON for every reported run. LongMemEval's paper metric requires its official LLM-as-judge protocol on the generated predictions.
 
 ## Reported results
 
-The camera-ready experimental record reports the following CogMem results. LoCoMo values are F1 / BLEU-1; LongMemEval values are LLM-as-judge accuracy. Results depend on the listed backbone, dataset version, prompts, and evaluation protocol—please use the reproduction guide rather than comparing these numbers across differently configured runs.
+The camera-ready experimental record reports the following CogMem results. LoCoMo values are F1 / BLEU-1; LongMemEval values are LLM-as-judge accuracy. Results depend on the listed backbone, dataset version, prompts, and evaluation protocol.
 
 | Benchmark | GPT-4o-mini | Qwen2.5-14B-Instruct |
 | --- | ---: | ---: |
@@ -121,7 +134,6 @@ The camera-ready experimental record reports the following CogMem results. LoCoM
 ```text
 cogmem/       Core library: graph schema, ingestion, consolidation, and agents
 datasets/     Dataset adapters and local-development dataset notes
-docs/         Architecture, reproducibility, and release documentation
 examples/     Small runnable examples
 scripts/      Benchmark evaluation runners
 tests/        Fast, offline unit tests
@@ -129,11 +141,11 @@ tests/        Fast, offline unit tests
 
 ## Safety and privacy
 
-CogMem stores potentially sensitive dialogue content, relationships, preferences, and attributed opinions. Use per-user workspaces, control access to persisted graph files, avoid logging raw conversations, and offer retention/deletion controls in any deployment. See [SECURITY.md](SECURITY.md) for a private vulnerability-reporting channel.
+CogMem stores potentially sensitive dialogue content, relationships, preferences, and attributed opinions. Use per-user workspaces, control access to persisted graph files, avoid logging raw conversations, and offer retention/deletion controls in any deployment. Report security issues and leaked credentials privately to the maintainers rather than opening a public issue.
 
 ## Contributing
 
-Contributions are welcome after the public release. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [the release checklist](docs/RELEASE_CHECKLIST.md) for the remaining publication steps.
+Until public release, coordinate changes privately with the maintainers. Before publishing this repository, confirm the paper's publication status; add its final URL and BibTeX; keep benchmark data, credentials, private conversations, and uncertain media out of Git history; run `uv sync --extra dev`, `uv run pytest`, and the documented smoke tests from a clean checkout; then verify every README result against the archived experiment outputs.
 
 ## License
 

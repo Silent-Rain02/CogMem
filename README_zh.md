@@ -86,7 +86,20 @@ config.runtime.max_concurrency = 2
 
 ## 复现实验
 
-仓库提供 LoCoMo 与 LongMemEval 的评测脚本。数据准备、论文配置、完整评测与 smoke test 的区别，均写在[复现指南](docs/REPRODUCIBILITY.md)中。
+仓库提供 LoCoMo 与 LongMemEval 的评测脚本。camera-ready 使用 BGE-M3（1024 维）嵌入、温度 `0.0`、15 个锚点、2 跳遍历、每跳最多 15 个邻居，以及最多 5 次控制器调用：
+
+```python
+from cogmem import CogMemConfig
+
+config = CogMemConfig()
+config.model.temperature = 0.0
+config.agent.find_anchors_top_k = 15
+config.agent.traverse_neighbors_max_depth = 2
+config.agent.traverse_neighbors_max_results = 15
+config.agent.max_iterations = 5
+```
+
+请先从官方来源下载基准数据：[LoCoMo 论文](https://aclanthology.org/2024.acl-long.747/)、[LoCoMo 官方仓库](https://github.com/snap-research/locomo)和 [LongMemEval 论文](https://openreview.net/forum?id=pZiyCaVuti)。本仓库不分发基准数据。
 
 ```bash
 # LoCoMo：构建图谱、执行巩固并评测。
@@ -102,11 +115,11 @@ uv run python scripts/eval_longmemeval_complete.py \
   --output artifacts/longmemeval_results.json
 ```
 
-本仓库不分发任何基准数据。请从官方来源下载 LoCoMo 和 LongMemEval，并将其本地路径传给评测脚本。具体来源及注意事项见 [`datasets/README.md`](datasets/README.md)。
+完整实验前，请先为 LoCoMo 添加 `--max_samples 1` 运行单题 smoke test。不同模型版本、服务提供方或部署栈、数据版本、提示词和 judge 配置均可能导致输出差异。每次报告实验时，请保存 Git 提交、数据校验和、模型标识、命令与完整输出 JSON。LongMemEval 的论文指标需要对生成结果再运行其官方 LLM-as-judge 协议。
 
 ## 已报告结果
 
-以下结果来自 camera-ready 实验记录。LoCoMo 指标为 F1 / BLEU-1，LongMemEval 指标为 LLM-as-judge Accuracy。结果受模型版本、数据版本、提示词与评测协议影响；请按复现指南运行，而不要跨不同配置直接比较。
+以下结果来自 camera-ready 实验记录。LoCoMo 指标为 F1 / BLEU-1，LongMemEval 指标为 LLM-as-judge Accuracy。结果受模型版本、数据版本、提示词与评测协议影响。
 
 | 基准 | GPT-4o-mini | Qwen2.5-14B-Instruct |
 | --- | ---: | ---: |
@@ -120,8 +133,7 @@ uv run python scripts/eval_longmemeval_complete.py \
 
 ```text
 cogmem/       核心库：图谱模式、写入、巩固与智能体
-datasets/     数据适配器与数据来源说明
-docs/         架构、复现与发布文档
+datasets/     数据适配器
 examples/     可直接运行的小示例
 scripts/      基准评测脚本
 tests/        无模型依赖的快速测试
@@ -129,11 +141,11 @@ tests/        无模型依赖的快速测试
 
 ## 安全与隐私
 
-CogMem 可能持久化敏感对话内容、关系、偏好以及来源归属的观点。在实际部署中，请按用户隔离工作目录，控制图谱文件访问权限，避免记录原始对话日志，并提供保留与删除机制。漏洞报告方式见 [SECURITY.md](SECURITY.md)。
+CogMem 可能持久化敏感对话内容、关系、偏好以及来源归属的观点。在实际部署中，请按用户隔离工作目录，控制图谱文件访问权限，避免记录原始对话日志，并提供保留与删除机制。发现漏洞或密钥泄露时，请通过维护者的私有渠道报告，而不要创建公开 issue。
 
 ## 贡献
 
-正式公开后欢迎贡献。开发流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，发布前剩余事项见[发布检查清单](docs/RELEASE_CHECKLIST.md)。
+正式公开前，请先与维护者私下协调改动。公开前需要确认论文状态并补充最终 URL 与 BibTeX；确保基准数据、密钥、私密对话和再分发许可不明确的素材均不进入 Git 历史；在干净环境中运行 `uv sync --extra dev`、`uv run pytest` 和上述 smoke test，并核对 README 的所有结果与归档实验输出一致。
 
 ## 许可证
 
