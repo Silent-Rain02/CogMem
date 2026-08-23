@@ -760,7 +760,7 @@ def comprehensive_evaluation(
                     )
                 except Exception as e:
                     # 静默处理错误，避免打印过多信息
-                    if verbose:
+                    if show_verbose:
                         print(f"[Warning] LLM Judge evaluation failed: {e}")
                     pass
             

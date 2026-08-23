@@ -17,6 +17,7 @@ class ModelConfig:
     api_base_url: Optional[str] = None
     api_key: Optional[str] = None
     embedding_dim: Optional[int] = 1024  # Will be auto-detected
+    temperature: float = 0.0
 
     # 聊天模型配置
     chat_model: Optional[str] = None  # 通用聊天模型
@@ -130,17 +131,10 @@ def classify_question_type(query: str) -> QuestionType:
         r"\b(why|what kind of|what type of|what personality|what political|what attributes)\b",
         r"\b(opinion|think|feel|believe|describe|considered)\b",
     ]
-    direct_lookup_patterns = [
-        r"\b(who|where|which|what)\b",
-        r"\b(has|have|did|does|is|are)\b",
-    ]
-
     multi_hop_score = _score(multi_hop_patterns)
     temporal_score = _score(temporal_patterns)
     adversarial_score = _score(adversarial_patterns)
     inferential_score = _score(inferential_patterns)
-    direct_score = _score(direct_lookup_patterns)
-
     if multi_hop_score >= 1:
         return "multi_hop"
 
@@ -152,9 +146,7 @@ def classify_question_type(query: str) -> QuestionType:
 
     # Counterfactual / hypothetical / trait attribution questions are open-domain,
     # but modal verbs alone should not override stronger temporal evidence.
-    if inferential_score >= 2:
-        return "open_domain"
-    if inferential_score >= 1 and temporal_score == 0 and direct_score == 0:
+    if inferential_score >= 1 and temporal_score == 0:
         return "open_domain"
 
     return "single_hop"

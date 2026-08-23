@@ -201,6 +201,23 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# CogMem local state and experiment artifacts
+.cogmem/
+.cogmem_*/
+workspace/
+artifacts/
+results/
+*_results.json
+*.faiss
+*.index
+*.pkl
+*.npy
+typed_indices/
+
+# Benchmarks are obtained from their official sources; do not redistribute
+# the local LoCoMo development copy in this repository.
+datasets/locomo10.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

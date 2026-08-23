@@ -105,21 +105,20 @@ class GraphStore:
                 # Debug: print error in development
                 import os
                 if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
-                    print(f"[GraphStore] Error parsing Entity {entity_id}: {e}")
+                    print(f"[GraphStore] Error parsing Concept {concept_id}: {e}")
                 return None
 
-        # Fallback: Try to get from index cache if not in graph
-        # This handles cases where entities exist in index but not in graph
-        if entity_id in self._id_to_node_index:
+        # Fallback: Try to get from index cache if not in graph.
+        if concept_id in self._id_to_node_index:
             try:
-                cached_data = self._id_to_node_index[entity_id]
+                cached_data = self._id_to_node_index[concept_id]
                 if isinstance(cached_data, dict):
-                    data_with_id = {**cached_data, "id": entity_id}
+                    data_with_id = {**cached_data, "id": concept_id}
                     node_type = data_with_id.get("node_type", "Entity")
 
                     # Debug: print processing info
                     if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
-                        print(f"[GraphStore] Processing cached {node_type} for {entity_id}")
+                        print(f"[GraphStore] Processing cached {node_type} for {concept_id}")
 
                     # Handle different node types appropriately
                     if node_type == "Person":
@@ -148,7 +147,7 @@ class GraphStore:
 
                     elif node_type == "Event":
                         # For events, create a pseudo-entity representation
-                        event_title = data_with_id.get("title", entity_id)
+                        event_title = data_with_id.get("title", concept_id)
                         data_with_id["name"] = event_title
                         data_with_id["type"] = "world"
                         data_with_id["subtype"] = "event"
@@ -226,7 +225,7 @@ class GraphStore:
                         return Concept(**data_with_id)
             except Exception as e:
                 if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
-                    print(f"[GraphStore] Error parsing cached Entity {entity_id}: {e}")
+                    print(f"[GraphStore] Error parsing cached Concept {concept_id}: {e}")
 
         return None
     
@@ -741,7 +740,7 @@ class GraphStore:
     
     # --- Multi-type node support ---
     
-    def add_node(self, node: Union[BaseNode, Entity, Person, Event, Fact, Claim]) -> None:
+    def add_node(self, node: BaseNode) -> None:
         """Add any type of node to the graph with type-safe NodeType metadata
 
         Args:
@@ -787,12 +786,14 @@ class GraphStore:
 
         self._changelog.append({"op": f"upsert_{node_type}", "id": node_id})
     
-    def add_nodes(self, nodes: Iterable[Union[Entity, Person, Event, Fact, Claim]]) -> None:
+    def add_nodes(self, nodes: Iterable[BaseNode]) -> None:
         """Add multiple nodes of any type"""
         for node in nodes:
             self.add_node(node)
     
-    def get_node(self, node_id: str, node_type: Optional[Union[NodeType, str]] = None) -> Optional[Dict[str, Any]]:
+    def get_node(
+        self, node_id: str, node_type: Optional[Union[NodeTypeEnum, str]] = None
+    ) -> Optional[Dict[str, Any]]:
         """Get node by ID, optionally filtering by NodeType enum
         
         ROOT FIX: 确保返回的数据总是包含 node_type 字段，如果没有则从节点ID推断
@@ -825,7 +826,7 @@ class GraphStore:
             node_data["id"] = node_id
         
         if node_type:
-            expected_type = node_type.value if isinstance(node_type, NodeType) else node_type
+            expected_type = node_type.value if isinstance(node_type, NodeTypeEnum) else node_type
             if node_data.get("node_type") != expected_type:
                 return None
         return node_data

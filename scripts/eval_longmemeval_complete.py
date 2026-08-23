@@ -18,8 +18,11 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-if SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, SCRIPTS_DIR)
+# Prefer the colocated LoCoMo runner over the legacy root-level script with
+# the same module name. This makes direct execution deterministic.
+if SCRIPTS_DIR in sys.path:
+    sys.path.remove(SCRIPTS_DIR)
+sys.path.insert(0, SCRIPTS_DIR)
 
 import dotenv
 dotenv.load_dotenv()

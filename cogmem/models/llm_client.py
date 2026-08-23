@@ -94,7 +94,7 @@ class OpenAICompatClient(LLMClient):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=0.2,
+            temperature=self._cfg.model.temperature,
         )
         content = resp.choices[0].message.content or ""
         self._chat_cache.set(key, content)
@@ -221,7 +221,7 @@ class OllamaClient(LLMClient):
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "options": {"temperature": 0.2},
+            "options": {"temperature": self._cfg.model.temperature},
         }
         start = time.time()
         r = requests.post(f"{self._base}/v1/chat/completions", json=payload, timeout=60)

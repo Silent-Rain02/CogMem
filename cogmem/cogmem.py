@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from typing import Dict, Iterable, List, Optional
 
 from .config import CogMemConfig, DEFAULT_CONFIG
@@ -49,7 +50,10 @@ class CogMem:
             workspace_dir: 工作空间目录，如果指定则覆盖配置中的persist_dir
             auto_load: 是否自动加载已有索引
         """
-        self.cfg = config or DEFAULT_CONFIG
+        # Each instance owns its configuration. The evaluation runners apply
+        # per-run overrides, so sharing DEFAULT_CONFIG would leak settings and
+        # workspace paths across instances in the same Python process.
+        self.cfg = deepcopy(config) if config is not None else deepcopy(DEFAULT_CONFIG)
         
         # 工作空间目录隔离：若指定则覆盖配置中的persist_dir
         if workspace_dir:
