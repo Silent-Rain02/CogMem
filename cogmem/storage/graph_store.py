@@ -904,118 +904,64 @@ class GraphStore:
     # --- Time-aware queries ---
     
     def get_facts_by_validity(
-        self,
-        query_time: Optional[str] = None,
-        subject: Optional[str] = None,
+        self, query_time: Optional[str] = None, subject: Optional[str] = None,
         predicate: Optional[str] = None
     ) -> List[Fact]:
-        """Get facts valid at query_time, optionally filtered by subject/predicate (with NodeType)
+        """Facts whose declared validity overlaps the requested calendar period.
 
-        Args:
-            query_time: ISO-8601 time string (defaults to now)
-            subject: Filter by subject ID
-            predicate: Filter by predicate
+        Unknown validity is not proof of validity. A single bound certifies its
+        stated precision only, consistently with the fact lookup operator.
         """
-        if query_time:
-            try:
-                query_dt = datetime.fromisoformat(query_time.replace('Z', '+00:00'))
-            except Exception:
-                query_dt = datetime.now()
-        else:
-            query_dt = datetime.now()
-
+        from ..utils.temporal import date_bounds
+        requested = date_bounds(query_time if query_time is not None else datetime.now().isoformat())
+        if not requested:
+            raise ValueError('query_time must be a valid calendar period or ISO timestamp')
         facts = []
         for node_id, data in self._g.nodes(data=True):
-            # Use node_type field with NodeType enum for type checking
-            if data.get("node_type") == NodeTypeEnum.FACT.value:
-                try:
-                    fact = Fact(**data)
-                    
-                    # Filter by subject/predicate
-                    if subject and fact.subject != subject:
-                        continue
-                    if predicate and fact.predicate != predicate:
-                        continue
-                    
-                    # Check validity
-                    valid = True
-                    if fact.valid_from:
-                        try:
-                            valid_from_dt = datetime.fromisoformat(fact.valid_from.replace('Z', '+00:00'))
-                            if query_dt < valid_from_dt:
-                                valid = False
-                        except Exception:
-                            pass
-                    
-                    if valid and fact.valid_to:
-                        try:
-                            valid_to_dt = datetime.fromisoformat(fact.valid_to.replace('Z', '+00:00'))
-                            if query_dt > valid_to_dt:
-                                valid = False
-                        except Exception:
-                            pass
-                    
-                    if valid:
-                        facts.append(fact)
-                except Exception:
-                    continue
-        
+            if data.get('node_type') != NodeTypeEnum.FACT.value or data.get('is_archived'):
+                continue
+            fact = Fact(**{**data, 'id': node_id})
+            if subject and fact.subject_id != subject:
+                continue
+            if predicate and fact.predicate != predicate:
+                continue
+            start, end = date_bounds(fact.valid_from), date_bounds(fact.valid_to)
+            start, end = start or end, end or start
+            if (start and end and start[0] <= end[1]
+                    and start[0] <= requested[1] and requested[0] <= end[1]):
+                facts.append(fact)
         return facts
-    
+
     def get_events_by_time_range(
-        self,
-        start_time: Optional[str] = None,
-        end_time: Optional[str] = None,
+        self, start_time: Optional[str] = None, end_time: Optional[str] = None,
         entity_id: Optional[str] = None
     ) -> List[Event]:
-        """Get events within time range (type-safe with NodeType enum)
-        
-        Args:
-            start_time: Start time in ISO-8601 format
-            end_time: End time in ISO-8601 format
-            entity_id: Optional entity ID to filter events for a specific person/entity
-            
-        Returns:
-            List of Event objects sorted by timestamp
-        """
+        """Calendar-overlap query over occurrence time; unknown time fails closed."""
+        from ..utils.temporal import date_bounds
+        lower, upper = date_bounds(start_time), date_bounds(end_time)
+        if ((start_time is not None and lower is None)
+                or (end_time is not None and upper is None)):
+            raise ValueError('Time bounds must be valid calendar periods or ISO timestamps')
+        if lower and upper and lower[0] > upper[1]:
+            raise ValueError('Time range start exceeds its end')
         events = []
         for node_id, data in self._g.nodes(data=True):
-            # Use node_type field with NodeType enum for type checking
-            if data.get("node_type") == NodeTypeEnum.EVENT.value:
-                try:
-                    event = Event(**data)
-                    
-                    # Filter by entity if specified
-                    if entity_id and entity_id not in event.participants:
-                        continue
-
-                    # Check if event overlaps with time range
-                    if start_time and end_time:
-                        if not event.overlaps_with(start_time, end_time):
-                            continue
-                    elif start_time and event.time_end:
-                        try:
-                            if datetime.fromisoformat(event.time_end.replace('Z', '+00:00')) < datetime.fromisoformat(start_time.replace('Z', '+00:00')):
-                                continue
-                        except Exception:
-                            pass
-                    elif end_time and event.time_start:
-                        try:
-                            if datetime.fromisoformat(event.time_start.replace('Z', '+00:00')) > datetime.fromisoformat(end_time.replace('Z', '+00:00')):
-                                continue
-                        except Exception:
-                            pass
-
-                    events.append(event)
-                except Exception as e:
-                    if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
-                        print(f"[GraphStore] Error parsing event {node_id}: {e}")
+            if data.get('node_type') != NodeTypeEnum.EVENT.value or data.get('is_archived'):
+                continue
+            event = Event(**{**data, 'id': node_id})
+            if entity_id and entity_id not in event.participants:
+                continue
+            if lower or upper:
+                start = date_bounds(event.time_start) or date_bounds(event.time_resolved)
+                end = date_bounds(event.time_end) if event.time_end else start
+                if not start or not end or start[0] > end[1]:
                     continue
-        
-        # Sort by timestamp
-        events.sort(key=lambda e: e.timestamp or "")
+                if (lower and end[1] < lower[0]) or (upper and start[0] > upper[1]):
+                    continue
+            events.append(event)
+        events.sort(key=lambda event: (event.time_start or event.time_resolved or '', event.id))
         return events
-    
+
     # --- SUPERSEDES chain traversal ---
     
     def get_supersedes_chain(self, fact_id: str) -> List[str]:
