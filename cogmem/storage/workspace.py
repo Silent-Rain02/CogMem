@@ -62,6 +62,9 @@ def validate_workspace(config, view):
     elif any(graph.get_node(key) is None for key in vectors._ids):
         raise ValueError('Vector address is missing from the graph')
     originals = {chunk.text for chunk in chunks._chunks}
+    source_documents = {chunk.doc_id for chunk in chunks._chunks}
+    if not evidence.get_processed_doc_ids() <= source_documents:
+        raise ValueError('Processed documents are missing their original source chunks')
     for key, texts in evidence._entity_to_chunks.items():
         if graph.get_node(key) is None or not set(texts) <= originals:
             raise ValueError('Evidence references do not resolve to this workspace original sources')

@@ -768,9 +768,9 @@ class Indexer:
                     raise
                 except Exception as e:
                     raise_if_execution_failure(e)
-                    # 如果fallback索引失败，记录警告但不影响主索引
-                    print(f"  [!] 警告：Chunk fallback索引失败: {e}")
-                    print(f"  [Indexer] 系统将无法使用Naive RAG fallback机制")
+                    # Original sources are mandatory even for a valid empty
+                    # extraction; a failed chunk projection cannot be committed.
+                    raise
         
         # 7. 最终保存（确保所有数据都已持久化）
         if self._cogmem:

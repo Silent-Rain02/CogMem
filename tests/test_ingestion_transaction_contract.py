@@ -64,3 +64,14 @@ def test_missing_vector_fails_before_live_bank_or_query_stack_is_rebound(monkeyp
     monkeypatch.setattr(Indexer,'_add_documents_uncommitted',incomplete)
     with pytest.raises(ValueError,match='without vector'):i.add_documents([Doc(id='a',text='A')])
     assert not commits and i._graph.num_entities()==0
+
+
+def test_empty_extraction_with_chunk_embedding_failure_never_commits(monkeypatch):
+    i=instance();i._cfg.runtime.max_concurrency=1;i._cfg.chunk.enable_chunk_embedding=False
+    i._llm=SimpleNamespace(chat=lambda **kwargs:'{"events":[],"facts":[],"claims":[]}')
+    def invalid_vectors(texts):raise ValueError('Invalid embedding shape')
+    i._embed=SimpleNamespace(encode=invalid_vectors)
+    with pytest.raises(ValueError,match='Invalid embedding shape'):
+        i.add_documents([Doc(id='source',text='Hello there.')])
+    assert i._chunk_store.size()==0 and not i._evidence.get_processed_doc_ids()
+    assert not i._evidence._document_hashes and i._graph.num_entities()==0

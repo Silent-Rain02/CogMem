@@ -187,3 +187,12 @@ def test_failed_rollback_keeps_a_recoverable_previous_generation(tmp_path,monkey
     assert recover_workspace(cfg,bank) is True
     assert {str(p.relative_to(bank)):p.read_bytes() for p in bank.rglob('*') if p.is_file()}==before
     assert set(read_workspace(cfg,bank).graph._g)=={'new'}
+
+
+def test_processed_empty_extraction_still_requires_its_original_document(tmp_path):
+    from cogmem.storage.workspace import WorkspaceView,validate_workspace
+    cfg=config();evidence=EvidenceStore();evidence.register_documents({'source':'An original with no extracted entities'})
+    evidence.mark_doc_processed('source');view=WorkspaceView(GraphStore(),TypedVectorStore(2),ChunkStore(2),evidence)
+    with pytest.raises(ValueError,match='missing their original'):validate_workspace(cfg,view)
+    view.chunks.add([Chunk('raw','An original with no extracted entities','source')],[[1.,0.]])
+    validate_workspace(cfg,view)  # A legitimate empty graph with its source is valid.
