@@ -10,6 +10,7 @@ v3.3 Enhancements:
 import json
 import re
 import time
+from collections import deque
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 
@@ -17,6 +18,7 @@ from cogmem.config import CogMemConfig, classify_question_type, QuestionType
 from cogmem.storage.graph_service import GraphService
 from cogmem.models.llm_client import LLMClient
 from cogmem.utils.text_utils import extract_clean_answer, extract_json_from_markdown
+from cogmem.utils.temporal import date_bounds, normalize_event_time
 from cogmem.prompt import SEARCH_AGENT_STEP_PROMPT, SEARCH_AGENT_SYSTEM_PROMPT, SEARCH_AGENT_CAN_ANSWER_PROMPT
 
 @dataclass
@@ -43,6 +45,7 @@ class SearchAgent:
         self.llm = llm
         self.cfg = config
         self.max_iterations = max_iterations
+        self.max_tool_calls = getattr(config.agent, "max_tool_calls", None) if config else None
         self.evidence_store = evidence_store  # EvidenceStore 实例，用于获取实体的原文证据
         self.tool_registry = tool_registry  # 可选：ToolRegistry，用于 trace/消融
         self.skill_runtime = None  # 由 QAOrchestrator 注入 SkillRuntime
@@ -105,6 +108,8 @@ class SearchAgent:
         """Reset mutable runtime search knobs from config before each run."""
         if self.cfg and hasattr(self.cfg, 'agent'):
             agent_cfg = self.cfg.agent
+            self.max_iterations = agent_cfg.max_iterations
+            self.max_tool_calls = getattr(agent_cfg, "max_tool_calls", None)
             self.semantic_search_top_k = agent_cfg.semantic_search_top_k
             self.find_anchors_top_k = agent_cfg.find_anchors_top_k
             self.traverse_neighbors_max_results = agent_cfg.traverse_neighbors_max_results
@@ -113,6 +118,20 @@ class SearchAgent:
             self.vector_search_expansion_factor = agent_cfg.vector_search_expansion_factor
             self.require_evidence_for_answer = getattr(agent_cfg, 'require_evidence_for_answer', True)
             self.auto_get_evidence = getattr(agent_cfg, 'auto_get_evidence', True)
+
+    def _operator_budget(self) -> int:
+        """Planning rounds and operator executions have different units.
+
+        Allow initial anchors + seeded retrieval/source (3 operations), then a
+        retrieval/source pair per planning round. Extra recovery operations also
+        consume this finite budget. An explicit caller limit overrides it.
+        """
+        explicit = getattr(self, 'max_tool_calls', None)
+        if explicit is not None:
+            if not isinstance(explicit, int) or isinstance(explicit, bool) or explicit < 1:
+                raise ValueError('max_tool_calls must be a positive integer')
+            return explicit
+        return 3 + 2 * max(0, int(self.max_iterations))
 
     def _enabled_skill_names(self) -> List[str]:
         """Return currently enabled skill names."""
@@ -129,6 +148,7 @@ class SearchAgent:
             enabled_skills=self._enabled_skill_names(),
             budgets={
                 "max_iterations": self.max_iterations,
+                "max_tool_calls": self._operator_budget(),
                 "semantic_search_top_k": self.semantic_search_top_k,
                 "find_anchors_top_k": self.find_anchors_top_k,
                 "traverse_neighbors_max_results": self.traverse_neighbors_max_results,
@@ -160,6 +180,7 @@ class SearchAgent:
         """Expose effective knobs used for the current run."""
         return {
             "max_iterations": self.max_iterations,
+            "max_tool_calls": self._operator_budget(),
             "semantic_search_top_k": self.semantic_search_top_k,
             "find_anchors_top_k": self.find_anchors_top_k,
             "traverse_neighbors_max_results": self.traverse_neighbors_max_results,
@@ -192,7 +213,7 @@ class SearchAgent:
         return self._format_node_to_rich_text(metadata, node_id)
 
     def _has_substantive_retrieval(self, history: List[ThoughtActionObservation]) -> bool:
-        substantive_actions = {"semantic_search", "fact_lookup", "claim_lookup", "timeline_query", "find_common_ground"}
+        substantive_actions = {"semantic_search", "fact_lookup", "claim_lookup", "timeline_query", "find_common_ground", "traverse_neighbors"}
         for step in history:
             if step.action in substantive_actions:
                 return True
@@ -208,7 +229,7 @@ class SearchAgent:
     def _select_evidence_target(self, anchor_results: List[Any], history: List[ThoughtActionObservation]) -> Optional[str]:
         for step in reversed(history):
             params = step.action_input or {}
-            if step.action in {"timeline_query", "semantic_search", "fact_lookup", "claim_lookup", "find_common_ground"}:
+            if step.action in {"timeline_query", "semantic_search", "fact_lookup", "claim_lookup", "find_common_ground", "traverse_neighbors"}:
                 recent_hits = self._last_tool_node_hits.get(step.action, [])
                 if recent_hits:
                     return recent_hits[0]
@@ -324,7 +345,7 @@ class SearchAgent:
 2. find_anchors(query: str, types: List[str] = None, top_k: int = 5)
    - Find entity nodes by name/ID (Person, Concept, Event).
    - Use this when you need to find a specific entity first.
-   - Example: find_anchors("Caroline", types=["person"])
+   - Example: find_anchors("Alice", types=["person"])
 
 3. timeline_query(entity_ids: List[str] = None, entity_id: str = "", time_query: str = "", relation_types: List[str] = None)
    - Explicit timeline lookup for temporal questions.
@@ -351,7 +372,7 @@ class SearchAgent:
 8. get_evidence(entity_id: str, limit: int = 3, query: str = None)
    - Get original text evidence (chunks) for an entity from the EvidenceStore.
    - Use this when you need to see the original text where an entity was mentioned.
-   - Example: get_evidence("p_caroline", limit=3) to get original text chunks mentioning Caroline.
+   - Example: get_evidence("p_alice", limit=3) to get original text chunks mentioning Alice.
    - This is useful for verifying answers or getting more context about an entity.
 """
 
@@ -389,7 +410,10 @@ class SearchAgent:
                 normalized["params"] = normalized.pop("args")
             if "action_input" in normalized and "params" not in normalized:
                 normalized["params"] = normalized.pop("action_input")
-            return normalized
+            # A JSON object inside ARGS is not an action envelope. In that
+            # case continue parsing TOOL/ARGS rather than discarding TOOL.
+            if "action" in normalized or "final_answer" in normalized:
+                return normalized
 
         final_match = re.search(r"FINAL_ANSWER\s*:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
         if final_match:
@@ -436,6 +460,8 @@ class SearchAgent:
         }
         self._current_query = query
         self._last_tool_node_hits = {}
+        self._tool_calls_used = 1  # Initial anchor lookup is an operator call.
+        self._planning_rounds_used = 0
 
         if self.skill_runtime is not None:
             self.skill_runtime.clear_trace()
@@ -448,6 +474,9 @@ class SearchAgent:
         routing_plan = self._current_routing_plan(routing_result)
         if routing_result is None or routing_result.triggered:
             self._apply_question_type_config(self._current_question_type)
+        self.system_prompt = SEARCH_AGENT_SYSTEM_PROMPT.format(
+            max_iterations=self.max_iterations, tools_description=self._get_tools_description()
+        ) + f"\nOperator executions have a separate cap of {self._operator_budget()}, including automatic source retrieval."
         
         if verbose:
             print(f"\n[SearchAgent] Starting ReAct loop for query: {query}")
@@ -459,20 +488,16 @@ class SearchAgent:
             tool_suggestion = self._suggest_tool_for_question(query, self._current_question_type)
         
         # Step 0: Pre-fetching Anchors
-        anchors_meta = self._robust_find_anchors(query)
-        anchors_json = json.dumps(anchors_meta, ensure_ascii=False) if anchors_meta else "[]"
-        
         anchor_results = self.graph_service.find_anchors(query, types=None, top_k=self.find_anchors_top_k)
         readable_anchors = []
         for anchor in anchor_results:
             metadata = anchor.metadata or {}
             if metadata.get("node_type") == "chunk":
-                readable_anchors.append(f"Raw Chunk: {metadata.get('text', 'unknown')[:300]}...")
+                readable_anchors.append(f"[ID: {anchor.node_id}] Raw Chunk: {metadata.get('text', 'unknown')[:300]}...")
             else:
-                readable_anchors.append(self._format_anchor_seed(metadata, anchor.node_id))
+                readable_anchors.append(f"[ID: {anchor.node_id}] {self._format_anchor_seed(metadata, anchor.node_id)}")
 
         obs_str = "\n".join(readable_anchors) if readable_anchors else "No anchors found"
-        step_counter += 1
         
         # v3.3: Include tool suggestion in initial observation
         if tool_suggestion:
@@ -516,6 +541,8 @@ class SearchAgent:
         effective_max_iterations = max(1, int(self.max_iterations))
         
         for round_idx in range(1, effective_max_iterations + 1):
+            if self._tool_calls_used >= self._operator_budget():
+                break
             history_str = "\n".join(step_scratchpad)
             # v3.3: 使用动态的最大迭代次数
             user_msg = SEARCH_AGENT_STEP_PROMPT.format(
@@ -527,6 +554,7 @@ class SearchAgent:
             if verbose:
                 print(f"\n[Round {round_idx}] Calling LLM...")
 
+            self._planning_rounds_used += 1
             resp = self.llm.chat(self.system_prompt, user_msg)
 
             if verbose:
@@ -659,7 +687,8 @@ class SearchAgent:
                 if round_idx > 2 and not self._looks_like_tool_protocol(resp):
                     ans = extract_clean_answer(resp, query)
                     if ans:
-                        return self._return_run_result(local_history, ans, "low")
+                        ans, confidence = self._postprocess_final_answer(query, ans, "low", local_history)
+                        return self._return_run_result(local_history, ans, confidence)
 
         # 如果达到最大迭代次数仍未得到答案，使用最后一次观察作为答案
         last_observation = local_history[-1].observation if local_history else ""
@@ -791,180 +820,20 @@ class SearchAgent:
             return f"Concept: {natural_name}"
         return f"{ntype}: {node.get('name', node.get('title', 'unknown'))}"
 
-    def _refine_academic(self, question: str, raw_answer: str, evidence: str, is_category3: bool = False) -> str:
-        """使用专用的 Refinement Prompt 提升 F1/BLEU 分数"""
-        from cogmem.prompt import ANSWER_REFINEMENT_PROMPT, ANSWER_REFINEMENT_CATEGORY3_PROMPT
+    def _refine_academic(self, question, raw_answer, evidence, is_category3=False):
+        """Generate from the supplied source view without post-hoc factual rewriting."""
+        from cogmem.prompt import ANSWER_REFINEMENT_PROMPT
+        response = self.llm.chat(
+            system=("Answer only from the supplied original source passages. "
+                    "Preserve speaker attribution and the specificity of explicit statements. "
+                    "A session date records when someone spoke, not when an event occurred. "
+                    "Resolve relative dates only against the date of their own source passage; "
+                    "preserve the stated year/month/day precision. "
+                    "If the sources do not establish the answer, say so. "
+                    "Return the concise answer without a reasoning preamble."),
+            user=ANSWER_REFINEMENT_PROMPT.format(question=question, evidence=evidence))
+        return extract_clean_answer(response, question)
 
-        month_map = {
-            "01": "January", "02": "February", "03": "March", "04": "April",
-            "05": "May", "06": "June", "07": "July", "08": "August",
-            "09": "September", "10": "October", "11": "November", "12": "December"
-        }
-        
-        def iso_to_natural(match):
-            y, m, d = match.groups()
-            return f"{int(d)} {month_map.get(m, m)} {y}"
-        
-        # ===== P0 FIX 1: 预处理证据 - 转换 concept IDs 为自然语言 =====
-        def convert_concept_ids_in_text(text: str) -> str:
-            """将文本中的 concept IDs (c_xxx) 和下划线格式的字符串转换为自然语言"""
-            # 匹配 c_xxx 格式的 concept IDs
-            concept_pattern = r'\b(c_[a-z0-9_]+)\b'
-            concept_ids_found = set(re.findall(concept_pattern, text))
-            
-            for concept_id in concept_ids_found:
-                # 尝试从图谱中获取 concept 名称
-                try:
-                    concept_node = self.graph_service.graph_store.get_node(concept_id)
-                    if concept_node and concept_node.get('node_type') == 'concept':
-                        concept_name = concept_node.get('name', '')
-                        if concept_name:
-                            # 将 concept_name 转换为自然语言（如果包含下划线）
-                            if '_' in concept_name:
-                                natural_name = concept_name.replace('_', ' ').title()
-                            else:
-                                natural_name = concept_name
-                            # 将 c_xxx 替换为自然语言名称
-                            text = text.replace(concept_id, natural_name)
-                            continue
-                except:
-                    pass
-                
-                # 如果无法从图谱获取，尝试从 ID 推断（去除 c_ 前缀，下划线转空格，首字母大写）
-                inferred_name = concept_id.replace('c_', '').replace('_', ' ').title()
-                text = text.replace(concept_id, inferred_name)
-            
-            # P0 FIX 扩展：匹配下划线格式的字符串（如 "giving_voice_to_trans_community", "playing_violin"）
-            # 这些可能是从 observation 中直接提取的 concept 名称
-            # 匹配模式：单词_单词_单词（至少2个下划线分隔的单词）
-            underscore_pattern = r'\b([a-z]+(?:_[a-z]+){1,})\b'
-            underscore_matches = set(re.findall(underscore_pattern, text.lower()))
-            
-            for match in underscore_matches:
-                # 跳过明显不是 concept 的字符串（如 "has_attribute", "relation_type" 等）
-                if match in ['has_attribute', 'relation_type', 'node_type', 'canonical_name', 
-                             'session_time', 'time_start', 'time_start_raw', 'recorded_at',
-                             'participated_in', 'traverse_neighbors', 'find_anchors']:
-                    continue
-                
-                # 尝试从图谱中查找对应的 concept 节点
-                # 可能的 ID 格式：c_xxx 或直接是下划线格式
-                possible_ids = [f"c_{match}", match]
-                found_concept = False
-                
-                for possible_id in possible_ids:
-                    try:
-                        concept_node = self.graph_service.graph_store.get_node(possible_id)
-                        if concept_node and concept_node.get('node_type') == 'concept':
-                            concept_name = concept_node.get('name', '')
-                            if concept_name:
-                                # 转换为自然语言
-                                if '_' in concept_name:
-                                    natural_name = concept_name.replace('_', ' ').title()
-                                else:
-                                    natural_name = concept_name
-                                # 替换所有出现的匹配字符串
-                                text = re.sub(r'\b' + re.escape(match) + r'\b', natural_name, text, flags=re.IGNORECASE)
-                                found_concept = True
-                                break
-                    except:
-                        continue
-                
-                # 如果没找到，直接转换下划线格式为自然语言
-                if not found_concept:
-                    natural_name = match.replace('_', ' ').title()
-                    text = re.sub(r'\b' + re.escape(match) + r'\b', natural_name, text, flags=re.IGNORECASE)
-            
-            return text
-        
-        # 预处理证据：转换 concept IDs 和 ISO 日期
-        evidence = convert_concept_ids_in_text(evidence)
-        evidence = re.sub(r'(\d{4})-(\d{2})-(\d{2})', iso_to_natural, evidence)
-        
-        # ===== P0 FIX 2: 预处理 raw_answer - 转换 concept IDs =====
-        raw_answer = convert_concept_ids_in_text(raw_answer)
-        
-        prompt_tmpl = ANSWER_REFINEMENT_CATEGORY3_PROMPT if is_category3 else ANSWER_REFINEMENT_PROMPT
-        user_prompt = prompt_tmpl.format(
-            question=question,
-            draft_answer=raw_answer or "",
-            evidence=evidence
-        )
-        
-        try:
-            refined = self.llm.chat(
-                system="You are a helpful assistant. Answer based on the provided evidence, and avoid returning internal IDs (e.g., c_xxx).",
-                user=user_prompt
-            )
-            
-            if "Short answer:" in refined:
-                refined = refined.split("Short answer:")[-1].strip()
-            
-            refined = refined.strip('"').strip("'").strip(".")
-            
-            # ===== P0 FIX 3: 后处理 - 再次转换可能遗漏的 concept IDs =====
-            refined = convert_concept_ids_in_text(refined)
-                    
-            # ===== P0 FIX 3.5: 清理 "C" 前缀残留（如 "C Lake Sunrise" -> "Lake Sunrise"） =====
-            # 匹配模式：单独的 "C" 后跟大写字母开头的单词（可能是从 "Concept:" 错误提取的）
-            refined = re.sub(r'\bC\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', r'\1', refined)
-            # 也清理 "C " 开头的答案（如果整个答案都是这样）
-            if refined.startswith("C ") and len(refined) > 2:
-                refined = refined[2:].strip()
-            
-            # ===== P0 FIX 4: 处理相对时间表达式 =====
-            # 从 evidence 中提取 session_time 或问题时间上下文（多种格式）
-            from datetime import datetime
-            
-            reference_date = None
-            # 尝试多种时间格式匹配
-            time_patterns = [
-                r'session-time:\s*(\d{4}-\d{2}-\d{2})',  # session-time: 2023-05-08
-                r'Recorded At:\s*(\d{4}-\d{2}-\d{2})',  # Recorded At: 2023-05-08
-                r'Question time:\s*(\d{4}-\d{2}-\d{2})',  # Question time: 2023-05-08
-                r'(\d{4}-\d{2}-\d{2})',  # 任何 YYYY-MM-DD 格式（作为fallback）
-            ]
-            
-            for pattern in time_patterns:
-                match = re.search(pattern, evidence, re.IGNORECASE)
-                if match:
-                    try:
-                        reference_date = datetime.strptime(match.group(1), "%Y-%m-%d")
-                        break  # 找到第一个有效日期就停止
-                    except:
-                        continue
-            
-            # 处理 "last year" 等相对时间表达式
-            if reference_date:
-                def resolve_relative_time(match):
-                    expr = match.group(0).lower()
-                    if "last year" in expr or "previous year" in expr:
-                        year = reference_date.year - 1
-                        return str(year)
-                    elif "yesterday" in expr:
-                        from datetime import timedelta
-                        yesterday = reference_date - timedelta(days=1)
-                        return f"{yesterday.day} {month_map.get(yesterday.strftime('%m'), yesterday.strftime('%m'))} {yesterday.year}"
-                    elif "last week" in expr:
-                        from datetime import timedelta
-                        last_week = reference_date - timedelta(days=7)
-                        return f"{last_week.day} {month_map.get(last_week.strftime('%m'), last_week.strftime('%m'))} {last_week.year}"
-                    elif "last month" in expr:
-                        from datetime import timedelta
-                        last_month = reference_date - timedelta(days=30)
-                        return f"{last_month.day} {month_map.get(last_month.strftime('%m'), last_month.strftime('%m'))} {last_month.year}"
-                    return match.group(0)
-                
-                refined = re.sub(r'\b(last year|previous year|yesterday|last week|last month)\b', resolve_relative_time, refined, flags=re.IGNORECASE)
-            
-            # 最终兜底：如果模型仍然输出了 2023-05-07，强制转换
-            refined = re.sub(r'(\d{4})-(\d{2})-(\d{2})', iso_to_natural, refined)
-            
-            return refined
-        except Exception:
-            # 即使出错，也要转换 raw_answer 中的 concept IDs
-            fallback_answer = convert_concept_ids_in_text(raw_answer)
-            return fallback_answer
 
     def _build_run_result(self, answer: str, reasoning_path: list, confidence: str, **extra: Any) -> Dict[str, Any]:
         """Build run() return dict with optional skill_flags and skill_usage for eval."""
@@ -974,6 +843,8 @@ class SearchAgent:
             "confidence": confidence,
             "question_type": self._current_question_type,
             "effective_agent_config": self._effective_agent_config(),
+            "operator_calls_used": getattr(self, "_tool_calls_used", 0),
+            "planning_rounds_used": getattr(self, "_planning_rounds_used", 0),
             **extra,
         }
         if self.skill_runtime is not None:
@@ -985,8 +856,37 @@ class SearchAgent:
         return [asdict(step) for step in history]
 
     def _return_run_result(self, history: List[ThoughtActionObservation], answer: str, confidence: str) -> Dict[str, Any]:
+        # One guard for every exit path, including early answers and fallbacks.
+        if self.require_evidence_for_answer and not self._has_raw_evidence(history):
+            answer, confidence = "I don't have enough information.", "low"
         self.history = history
         return self._build_run_result(answer, self._history_dump(history), confidence)
+
+    def _needs_evidence_for_target(self, target, history):
+        """An earlier source does not ground a newly selected retrieval address."""
+        raw_steps = [step for step in history if self._has_raw_evidence([step])]
+        if any((step.action_input or {}).get('entity_id') == target for step in raw_steps):
+            return False
+        # Different graph addresses can already resolve to the exact same source.
+        store = getattr(self, 'evidence_store', None)
+        possible = store.get_chunks(target, limit=None) if store else []
+        loaded = {item['content'].strip() for step in raw_steps
+                  for item in self._structured_observation_payload(step)['items']
+                  if isinstance(item, dict) and item.get('content')}
+        if possible and all(text.strip() in loaded for text in possible):
+            return False
+        return True
+
+    def _has_raw_evidence(self, history: List[ThoughtActionObservation]) -> bool:
+        for step in history:
+            if step.action != "get_evidence" or not (step.observation or "").startswith("Original Text Evidence for "):
+                continue
+            payload = self._structured_observation_payload(step)
+            if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+                if any(isinstance(item, dict) and str(item.get("content", "")).strip()
+                       for item in payload["items"]):
+                    return True
+        return False
 
     def _record_step(
         self,
@@ -1036,6 +936,22 @@ class SearchAgent:
             action_input=action_input,
             observation=observation,
         )
+        if (self.require_evidence_for_answer and action in {
+                "semantic_search", "fact_lookup", "claim_lookup", "timeline_query", "find_common_ground", "traverse_neighbors"}):
+            targets = list(self._last_tool_node_hits.get(action, []))
+            if not targets:
+                target = self._select_evidence_target([], history)
+                targets = [target] if target else []
+            targets = list(dict.fromkeys(target for target in targets if self._needs_evidence_for_target(target, history)))
+            if targets:
+                address = {"entity_id":targets[0]} if len(targets)==1 else {"entity_ids":targets}
+                params = {**address, "limit": 3, "query": query}
+                raw = self._execute_tool("get_evidence", params)
+                step_counter = self._record_step(
+                    history, scratchpad, step_counter,
+                    thought="Resolve retrieved index cues to original source before answering.",
+                    action="get_evidence", action_input=params, observation=raw)
+                self._evidence_collected = self._has_raw_evidence(history)
         early_answer = self._maybe_finalize_after_step(query, history, action=action)
         if early_answer is None:
             return step_counter, None
@@ -1158,6 +1074,12 @@ class SearchAgent:
     def _execute_tool(self, name: str, params: Dict[str, Any]) -> str:
         if name not in self.tools:
             return f"Error: Tool {name} not found."
+        if name in {"semantic_search","fact_lookup","claim_lookup","timeline_query","find_common_ground","traverse_neighbors"} and hasattr(self,'_last_tool_node_hits'):
+            self._remember_tool_hits(name, [])  # A failed/empty retrieval cannot reuse old hits.
+        used = getattr(self, "_tool_calls_used", 0)
+        if used >= self._operator_budget():
+            return "Tool budget exhausted."
+        self._tool_calls_used = used + 1
         if self.skill_runtime is not None:
             ctx = self._build_skill_context()
             skill_name = self._tool_skill_name(name, params)
@@ -1211,7 +1133,9 @@ class SearchAgent:
     def _should_attempt_stepwise_answer(self, action: str, history: List[ThoughtActionObservation]) -> bool:
         if not history:
             return False
-        if action not in {"semantic_search", "claim_lookup", "fact_lookup", "timeline_query", "find_common_ground", "get_evidence"}:
+        if self.require_evidence_for_answer and not self._has_raw_evidence(history):
+            return False
+        if action not in {"semantic_search", "claim_lookup", "fact_lookup", "timeline_query", "find_common_ground", "traverse_neighbors", "get_evidence"}:
             return False
         if action == "get_evidence" and not self._has_substantive_retrieval(history[:-1]):
             return False
@@ -1268,6 +1192,8 @@ class SearchAgent:
         question: str,
         history: List[ThoughtActionObservation],
     ) -> Optional[tuple[str, str]]:
+        if self.require_evidence_for_answer and not self._has_raw_evidence(history):
+            return None
         if not self._has_substantive_retrieval(history):
             return None
         evidence = self._build_synthesis_evidence(history)
@@ -1298,7 +1224,7 @@ class SearchAgent:
             return None
         if not isinstance(data, dict):
             return None
-        if not data.get("can_answer"):
+        if data.get("can_answer") is not True:
             return None
         answer = extract_clean_answer(str(data.get("answer", "")), question)
         confidence = str(data.get("confidence", "medium"))
@@ -1361,13 +1287,10 @@ class SearchAgent:
             if season in lowered:
                 return "fall" if season == "autumn" else season
         try:
-            from cogmem.utils.temporal_parser import normalize_time_format, parse_relative_time
+            from cogmem.utils.temporal_parser import normalize_time_format
             normalized = normalize_time_format(time_query)
             if normalized:
                 return normalized.replace("-XX", "")
-            resolved_start, _, _, _ = parse_relative_time(time_query)
-            if resolved_start:
-                return str(resolved_start).split("T")[0]
         except Exception:
             pass
         return time_query
@@ -1381,7 +1304,7 @@ class SearchAgent:
         results = []
         for a in anchors:
             node_text = self._format_node_to_rich_text(a.metadata or {}, a.node_id)
-            results.append(node_text)
+            results.append(f"[ID: {a.node_id}] {node_text}")
             
             # ===== 如果启用且EvidenceStore可用，自动附加原文证据 =====
             if include_evidence and self.evidence_store:
@@ -1449,17 +1372,11 @@ class SearchAgent:
             node_text = self._format_node_to_rich_text(node_data, node_id)
             results_by_type[node_type].append((score, node_text, node_id))
 
-        results = []
-        hit_ids = []
-        for nt in node_types:
-            for score, node_text, node_id in results_by_type.get(nt, []):
-                results.append(f"[Score: {score:.3f}] [ID: {node_id}] {node_text}")
-                if node_id not in hit_ids:
-                    hit_ids.append(node_id)
-                if len(results) >= top_k:
-                    break
-            if len(results) >= top_k:
-                break
+        ranked = sorted(
+            (item for group in results_by_type.values() for item in group),
+            key=lambda item: (-item[0], item[2]))[:top_k]
+        results = [f"[Score: {score:.3f}] [ID: {node_id}] {text}" for score, text, node_id in ranked]
+        hit_ids = [node_id for _, _, node_id in ranked]
 
         if not results:
             return "No semantically similar nodes found."
@@ -1474,17 +1391,28 @@ class SearchAgent:
         
         # 如果提供了 time_query，执行时间线查询
         if time_query:
-            return self._tool_scan_timeline(ids, time_query)
+            observation = self._tool_scan_timeline(ids, time_query)
+            self._remember_tool_hits("traverse_neighbors", self._last_tool_node_hits.get("timeline_query", []))
+            return observation
         
         # 普通遍历：使用配置的默认 max_depth
         if max_depth is None or max_depth == 1:
             max_depth = self.traverse_neighbors_max_depth
         
         res = self.graph_service.traverse_associations(ids, relation_types=relation_types, direction=direction, max_depth=max_depth)
-        return "\n".join([f"[{r.relation_type}] -> {self._format_node_to_rich_text(r.target_node or {}, r.target_id)}" for r in res[:self.traverse_neighbors_max_results]])
+        focus_terms = self._extract_focus_terms(getattr(self, "_current_query", ""))
+        if focus_terms:
+            res = sorted(res, key=lambda result: (
+                -self._score_query_node(result.target_node or {}, focus_terms),
+                result.target_id, result.source_id, result.relation_type,
+            ))
+        selected = res[:self.traverse_neighbors_max_results]
+        self._remember_tool_hits("traverse_neighbors", [r.target_id for r in selected])
+        return "\n".join([f"[{r.relation_type}] -> [ID: {r.target_id}] {self._format_node_to_rich_text(r.target_node or {}, r.target_id)}" for r in selected])
     
     def _tool_scan_timeline(self, entity_ids: List[str], time_query: str = "") -> str:
         """扫描时间线（内部方法，由 traverse_neighbors 调用）"""
+        self._remember_tool_hits("timeline_query", [])
         season_months = {
             "spring": {3, 4, 5},
             "summer": {6, 7, 8},
@@ -1516,7 +1444,7 @@ class SearchAgent:
             ]).lower()
             if season in haystack:
                 return True
-            for field_name in ("time_start", "time_resolved", "session_time"):
+            for field_name in ("time_start", "time_resolved"):
                 month = _extract_month(str(item.get(field_name, "")))
                 if month in months:
                     return True
@@ -1566,16 +1494,12 @@ class SearchAgent:
                 if is_season_query:
                     match = _matches_season(e, time_query_lower)
                 elif is_time_value:
-                    # 时间值查询：在时间字段中搜索
-                    t_start = str(e.get("time_start", "")).lower()
-                    t_raw = str(e.get("time_start_raw", "")).lower()
-                    session = str(e.get("session_time", "")).lower()
-                    # 检查是否包含时间值（支持部分匹配，如"2022"匹配"2022-01-01"）
-                    match = (time_query_lower in t_start or 
-                            time_query_lower in t_raw or 
-                            time_query_lower in session or
-                            t_start.startswith(time_query_lower) or
-                            t_raw.startswith(time_query_lower))
+                    # Recording time is never a substitute for occurrence time.
+                    effective = (normalize_event_time(e.get('time_start')) or
+                                 normalize_event_time(e.get('time_resolved')))
+                    bounds = date_bounds(effective)
+                    requested = date_bounds(time_query_lower)
+                    match = bool(bounds and requested and bounds[0] <= requested[1] and requested[0] <= bounds[1])
                 else:
                     # 语义查询：在事件标题和描述中搜索
                     title = str(e.get("title", "")).lower()
@@ -1596,7 +1520,6 @@ class SearchAgent:
                 str(item.get("description", "")),
                 str(item.get("content", "")),
                 str(item.get("time_start_raw", "")),
-                str(item.get("session_time", "")),
             ]).lower()
             score = 0.0
             for term in focus_terms:
@@ -1615,7 +1538,7 @@ class SearchAgent:
             events.sort(
                 key=lambda item: (
                     _timeline_score(item),
-                    str(item.get("time_start") or item.get("time_start_raw") or item.get("session_time") or ""),
+                    str(item.get("time_start") or item.get("time_resolved") or ""),
                 ),
                 reverse=True,
             )
@@ -1632,18 +1555,14 @@ class SearchAgent:
                     continue
                 content = str(node_data.get("content", "")).lower()
                 if focus_terms and not any(term in content for term in focus_terms):
-                    session = str(node_data.get("session_time", "")).lower()
-                    if not any(term in session for term in focus_terms):
-                        continue
+                    continue
                 if time_query_lower and time_query_lower != "*" and time_query_lower not in content:
-                    session = str(node_data.get("session_time", "")).lower()
-                    if time_query_lower not in session:
-                        continue
+                    continue
                 fact_matches.append({**node_data, "id": node_data.get("id") or node_id})
             fact_matches.sort(
                 key=lambda item: (
                     sum(2.0 for term in focus_terms if term in str(item.get("content", "")).lower()),
-                    str(item.get("session_time", "")),
+                    str(item.get("id", "")),
                 ),
                 reverse=True,
             )
@@ -1711,9 +1630,13 @@ class SearchAgent:
                 if latest_only and node_data.get("is_latest") is False:
                     continue
                 if normalized_time:
-                    valid_from = str(node_data.get("valid_from", "") or node_data.get("session_time", ""))
-                    valid_to = str(node_data.get("valid_to", "") or valid_from)
-                    if valid_from and valid_to and not (valid_from <= normalized_time <= valid_to):
+                    start = date_bounds(node_data.get('valid_from'))
+                    end = date_bounds(node_data.get('valid_to'))
+                    requested = date_bounds(normalized_time)
+                    # Unknown validity is not the date the statement was recorded.
+                    # A single explicit bound certifies only its stated precision.
+                    start, end = start or end, end or start
+                    if not (start and end and requested and start[0] <= requested[1] and requested[0] <= end[1]):
                         continue
                 item = {**node_data, "id": node_data.get("id") or node_id}
                 haystack = " ".join([
@@ -1728,8 +1651,6 @@ class SearchAgent:
                         query_score += 2.0
                 if predicate and predicate.lower() in str(item.get("predicate", "")).lower():
                     query_score += 3.0
-                if normalized_time and normalized_time in str(item.get("session_time", "")):
-                    query_score += 2.5
                 if item.get("is_latest") is not False:
                     query_score += 0.25
                 item["_query_score"] = query_score
@@ -1740,7 +1661,7 @@ class SearchAgent:
             key=lambda item: (
                 item.get("_query_score", 0.0),
                 item.get("is_latest") is not False,
-                item.get("valid_to") or item.get("session_time") or "",
+                item.get("valid_to") or item.get("valid_from") or "",
                 item.get("confidence", 0.0),
             ),
             reverse=True,
@@ -1750,7 +1671,7 @@ class SearchAgent:
         for idx, item in enumerate(results[:limit], start=1):
             validity = ""
             if item.get("valid_from") or item.get("valid_to"):
-                validity = f" | Valid: {item.get('valid_from') or '?'} -> {item.get('valid_to') or 'ongoing'}"
+                validity = f" | Valid: {item.get('valid_from') or '?'} -> {item.get('valid_to') or '?'}"
             elif item.get("session_time"):
                 validity = f" | Session: {item.get('session_time')}"
             lines.append(f"{idx}. [ID: {item.get('id')}] {self._format_node_to_rich_text(item, item.get('id'))}{validity}")
@@ -1793,7 +1714,9 @@ class SearchAgent:
         P2 FIX: Enhanced to support Fact semantic matching for multi-hop questions.
         """
         cg = self.graph_service.find_common_ground(entity_ids, node_types=node_types)
-        common_nodes = list(cg.common_nodes[:self.find_common_ground_top_k]) if cg.common_nodes else []
+        # Ranking must precede the budget. The service returns a set intersection,
+        # whose iteration order is not a relevance order.
+        common_nodes = list(cg.common_nodes) if cg.common_nodes else []
         query = self._current_query or ""
         focus_terms = self._extract_focus_terms(query)
         
@@ -1863,6 +1786,7 @@ class SearchAgent:
                                 'content': pattern_desc,
                                 'fact1_content': pair['fact1'].get('content', ''),
                                 'fact2_content': pair['fact2'].get('content', ''),
+                                'supporting_node_ids': [pair['fact1']['id'], pair['fact2']['id']],
                             }
                             common_nodes.append(pattern_node)
 
@@ -1871,8 +1795,9 @@ class SearchAgent:
                         pattern_node = {
                             'node_type': 'pattern',
                             'content': f"Shared fact theme: {term}",
-                            'fact1_content': evidence_rows[0] if evidence_rows else '',
-                            'fact2_content': evidence_rows[1] if len(evidence_rows) > 1 else '',
+                            'fact1_content': evidence_rows[0].get('content', '') if evidence_rows else '',
+                            'fact2_content': evidence_rows[1].get('content', '') if len(evidence_rows) > 1 else '',
+                            'supporting_node_ids': [row['id'] for row in evidence_rows if row.get('id')],
                         }
                         common_nodes.append(pattern_node)
             except Exception as e:
@@ -1882,22 +1807,27 @@ class SearchAgent:
         if not common_nodes:
             return "No common ground found."
 
-        if focus_terms:
-            common_nodes.sort(
-                key=lambda node: self._score_common_ground_node(node, focus_terms),
-                reverse=True,
-            )
+        common_nodes.sort(key=lambda node: (
+            -self._score_common_ground_node(node, focus_terms) if focus_terms else 0,
+            str(node.get('id') or '|'.join(sorted(node.get('supporting_node_ids', [])))),
+            json.dumps(node, sort_keys=True, default=str),
+        ))
         common_nodes = common_nodes[:self.find_common_ground_top_k]
         
         result_lines = []
+        hit_ids = []
         for node in common_nodes:
+            addresses = node.get('supporting_node_ids', []) if node.get('node_type') == 'pattern' else [node.get('id')]
+            hit_ids.extend(address for address in addresses
+                           if address and self.graph_service.graph_store.get_node(address))
             if node.get('node_type') == 'pattern':
                 # Format pattern nodes specially
                 result_lines.append(f"- {node['content']}")
                 result_lines.append(f"  * Entity 1: {node['fact1_content']}")
                 result_lines.append(f"  * Entity 2: {node['fact2_content']}")
             else:
-                result_lines.append(f"- {self._format_node_to_rich_text(node)}")
+                result_lines.append(f"- [ID: {node.get('id', '')}] {self._format_node_to_rich_text(node)}")
+        self._remember_tool_hits("find_common_ground", hit_ids)
         
         return "Common Nodes Found:\n" + "\n".join(result_lines)
 
@@ -1917,7 +1847,7 @@ class SearchAgent:
         stopwords = {
             "what", "when", "where", "which", "who", "whom", "does", "did", "have", "has",
             "both", "their", "they", "them", "with", "about", "into", "from", "that", "this",
-            "were", "been", "being", "would", "could", "should", "caroline", "melanie"
+            "were", "been", "being", "would", "could", "should"
         }
         terms = set()
         for token in re.findall(r"[A-Za-z0-9_]+", query.lower()):
@@ -1926,7 +1856,7 @@ class SearchAgent:
                 terms.add(normalized)
         return terms
 
-    def _score_common_ground_node(self, node: Dict[str, Any], focus_terms: set[str]) -> float:
+    def _score_query_node(self, node: Dict[str, Any], focus_terms: set[str]) -> float:
         text_parts = [
             str(node.get("name", "")),
             str(node.get("title", "")),
@@ -1937,26 +1867,28 @@ class SearchAgent:
         ]
         haystack = " ".join(text_parts).lower()
         score = 0.0
+        for term in focus_terms:
+            if term in self._normalize_match_token(haystack) or term in haystack:
+                score += 3.0
+        return score
+
+    def _score_common_ground_node(self, node: Dict[str, Any], focus_terms: set[str]) -> float:
+        score = self._score_query_node(node, focus_terms)
         if node.get("node_type") == "pattern":
             score += 4.0
         elif node.get("node_type") == "concept":
             score += 2.0
-        for term in focus_terms:
-            if term in self._normalize_match_token(haystack) or term in haystack:
-                score += 3.0
-        if "paint" in haystack or "art" in haystack or "draw" in haystack:
-            score += 2.0
         return score
 
-    def _extract_shared_fact_terms(self, facts_groups: List[List[Dict[str, Any]]], focus_terms: set[str]) -> List[tuple[str, List[str]]]:
+    def _extract_shared_fact_terms(self, facts_groups: List[List[Dict[str, Any]]], focus_terms: set[str]) -> List[tuple[str, List[Dict[str, Any]]]]:
         if len(facts_groups) < 2:
             return []
         generic_terms = {
-            "like", "paint", "create", "have", "use", "make", "find", "fact",
-            "caroline", "melanie", "person", "subject", "object", "and"
+            "like", "create", "have", "use", "make", "find", "fact",
+            "person", "subject", "object", "and"
         }
         per_group_terms = []
-        examples_by_term: Dict[str, List[str]] = {}
+        examples_by_term: Dict[str, List[Optional[Dict[str, Any]]]] = {}
         for group_idx, facts in enumerate(facts_groups):
             group_terms = set()
             for fact in facts:
@@ -1971,9 +1903,9 @@ class SearchAgent:
                     if len(normalized) < 3 or normalized in generic_terms:
                         continue
                     group_terms.add(normalized)
-                    examples_by_term.setdefault(normalized, [""] * len(facts_groups))
+                    examples_by_term.setdefault(normalized, [None] * len(facts_groups))
                     if not examples_by_term[normalized][group_idx]:
-                        examples_by_term[normalized][group_idx] = str(fact.get("content", ""))
+                        examples_by_term[normalized][group_idx] = fact
             per_group_terms.append(group_terms)
         shared = set.intersection(*per_group_terms) if per_group_terms else set()
         ranked = []
@@ -1981,15 +1913,17 @@ class SearchAgent:
             score = 1
             if term in focus_terms:
                 score += 4
-            if term in {"art", "landscape", "flower", "painting", "paint"}:
-                score += 2
             examples = [example for example in examples_by_term.get(term, []) if example]
             ranked.append((score, term, examples[:2]))
-        ranked.sort(reverse=True)
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
         return [(term, examples) for _, term, examples in ranked]
 
     def _is_low_signal_answer(self, answer: str) -> bool:
         if not answer:
+            return True
+        # This is the explicit failure value required by the reader contract.
+        # It remains a valid final abstention, but cannot certify early success.
+        if answer.strip().rstrip('.').casefold() == "i don't have enough information":
             return True
         lowered = answer.lower()
         markers = [
@@ -2029,186 +1963,19 @@ class SearchAgent:
 
         return candidate
 
-    def _has_contradictory_shared_claim(self, answer: str) -> bool:
-        lowered = (answer or "").lower()
-        affirmative = any(token in lowered for token in ["both", "shared", "same subject", "共同"])
-        insufficient = any(
-            token in lowered
-            for token in [
-                "no evidence",
-                "not enough evidence",
-                "does not provide",
-                "not clearly identified",
-                "insufficient",
-                "没有证据",
-                "证据不足",
-            ]
-        )
-        return affirmative and insufficient
-
-    def _extract_terms_from_payload(self, payload: Any) -> set[str]:
-        generic_terms = {
-            "like", "paint", "create", "have", "make", "find", "consider", "believe", "both",
-            "subject", "shared", "common", "thing", "fact", "event", "concept", "node",
-            "question", "evidence", "item", "step", "action", "score", "caroline", "melanie",
-        }
-        if isinstance(payload, str):
-            haystack = payload.lower().replace("_", " ")
-        else:
-            haystack = json.dumps(payload, ensure_ascii=False).lower().replace("_", " ")
-        terms = set()
-        for token in re.findall(r"[A-Za-z0-9]+", haystack):
-            normalized = self._normalize_match_token(token)
-            if len(normalized) < 3 or normalized in generic_terms:
-                continue
-            terms.add(normalized)
-        return terms
-
-    def _is_insufficient_answer(self, answer: str) -> bool:
-        lowered = (answer or "").lower()
-        return any(
-            token in lowered
-            for token in [
-                "no evidence",
-                "not enough evidence",
-                "insufficient",
-                "not clearly identified",
-                "no clear",
-                "没有证据",
-                "证据不足",
-                "无法确定",
-            ]
-        )
-
-    def _is_affirmative_multi_hop_answer(self, answer: str) -> bool:
-        lowered = (answer or "").lower()
-        if self._is_insufficient_answer(answer):
-            return False
-        return any(
-            token in lowered
-            for token in [
-                "both",
-                "shared",
-                "same subject",
-                "共同",
-                "两人都",
-                "the subject",
-            ]
-        )
-
-    def _shared_support_terms(self, query: str, history: List[ThoughtActionObservation]) -> set[str]:
-        package = self._build_synthesis_evidence_package(history)
-        shared_terms = set()
-        for item in package.get("shared_evidence", []):
-            shared_terms.update(self._extract_terms_from_payload(item.get("evidence")))
-        return shared_terms
-
-    def _shared_fact_theme_terms(self, history: List[ThoughtActionObservation]) -> set[str]:
-        terms = set()
-        pattern = re.compile(r"Shared fact theme:\s*(.+)$", re.IGNORECASE)
-        for step in history:
-            if step.action != "find_common_ground":
-                continue
-            for raw_line in (step.observation or "").splitlines():
-                match = pattern.search(raw_line.strip())
-                if not match:
-                    continue
-                terms.update(self._extract_terms_from_payload(match.group(1)))
-        return terms
-
-    def _requires_specific_shared_topic(self, query: str) -> bool:
-        query_lower = query.lower()
-        return any(token in query_lower for token in ["subject", "theme", "which", "what subject"])
-
-    def _multi_hop_answer_supported(self, query: str, answer: str, history: List[ThoughtActionObservation]) -> bool:
-        if self._current_question_type != "multi_hop":
-            return True
-        if self._is_insufficient_answer(answer):
-            return True
-        if not self._is_affirmative_multi_hop_answer(answer):
-            return True
-        shared_terms = self._shared_support_terms(query, history)
-        if not shared_terms:
-            return False
-        answer_terms = self._extract_terms_from_payload(answer)
-        generic_shared_terms = {"art", "painting", "paint", "drawing", "draw", "create"}
-        if self._requires_specific_shared_topic(query):
-            specific_shared_terms = {
-                term for term in self._shared_fact_theme_terms(history)
-                if term not in generic_shared_terms
-            }
-            return bool(answer_terms & specific_shared_terms)
-        return bool(answer_terms & shared_terms)
-
-    def _conservative_multi_hop_answer(self, query: str, history: List[ThoughtActionObservation]) -> Optional[str]:
-        if self._current_question_type != "multi_hop":
-            return None
-        package = self._build_synthesis_evidence_package(history)
-        query_entities = package.get("query_entities", [])
-        entity_evidence = package.get("entity_evidence", {})
-        if len(query_entities) >= 2:
-            snippets = []
-            for entity in query_entities[:2]:
-                items = entity_evidence.get(entity, [])
-                if not items:
-                    continue
-                first_item = items[0].get("evidence", {})
-                preview = ""
-                if isinstance(first_item, dict):
-                    if "items" in first_item and first_item["items"]:
-                        preview = str(first_item["items"][0])
-                    elif "text" in first_item:
-                        preview = str(first_item["text"])
-                if preview:
-                    snippets.append(f"{entity}: {preview}")
-            if snippets:
-                return (
-                    f"目前没有足够证据证明{query_entities[0]}和{query_entities[1]}在这个问题上存在明确共同点。"
-                    f" 现有证据仅分别显示 {'; '.join(snippets)}。"
-                )
-        return "目前没有足够证据证明题目要求的共享结论。"
-
-    def _postprocess_final_answer(
-        self,
-        query: str,
-        answer: str,
-        confidence: str,
-        history: List[ThoughtActionObservation],
-    ) -> tuple[str, str]:
-        candidate = self._sanitize_final_answer_candidate(answer)
-        updated_confidence = confidence
-
-        synthesized = self._synthesize_answer_with_llm(query, candidate, history)
-        if synthesized and not self._is_low_signal_answer(synthesized):
-            candidate = synthesized
-            if updated_confidence == "low":
-                updated_confidence = "medium"
-
-        if not self._multi_hop_answer_supported(query, candidate, history):
-            conservative = self._conservative_multi_hop_answer(query, history)
-            if conservative:
-                candidate = conservative
-                if updated_confidence == "high":
-                    updated_confidence = "medium"
-
-        heuristic_ans = self._heuristic_multi_hop_answer(query, history)
-        if heuristic_ans and (
-            self._is_low_signal_answer(candidate)
-            or updated_confidence == "low"
-            or self._has_contradictory_shared_claim(candidate)
-        ):
-            candidate = heuristic_ans
-            updated_confidence = "medium"
-
-        claim_ans = self._heuristic_claim_answer(query, history)
-        if claim_ans and (self._is_low_signal_answer(candidate) or updated_confidence == "low"):
-            candidate = claim_ans
-            updated_confidence = "medium"
-
-        candidate = self._sanitize_final_answer_candidate(candidate)
-        return candidate, updated_confidence
+    def _postprocess_final_answer(self, query, answer, confidence, history):
+        if self.require_evidence_for_answer and not self._has_raw_evidence(history):
+            return "I don't have enough information.", "low"
+        synthesized = self._synthesize_answer_with_llm(query, "", history)
+        if synthesized:
+            return self._sanitize_final_answer_candidate(synthesized), confidence
+        # A failed consumer cannot fall back to a controller's graph-based draft.
+        return "I don't have enough information.", "low"
 
     def _build_synthesis_evidence_package(self, history: List[ThoughtActionObservation], max_items: int = 5) -> Dict[str, Any]:
+        if self.require_evidence_for_answer:
+            history = [step for step in history
+                       if step.action == "get_evidence" and self._has_raw_evidence([step])]
         prioritized_actions = [
             "get_evidence",
             "claim_lookup",
@@ -2363,7 +2130,8 @@ class SearchAgent:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("HINT:"):
                     continue
-                prefix = stripped.split(":", 1)[0] if ":" in stripped else ""
+                _, content = _extract_inline_id(stripped)
+                prefix = content.split(":", 1)[0] if ":" in content else ""
                 if prefix in {"Person", "Concept", "Event", "Fact", "Claim"}:
                     items.append(stripped)
             return {"type": action, "items": items[:8] or observation[:400]}
@@ -2383,34 +2151,20 @@ class SearchAgent:
 
         if action == "get_evidence":
             items = []
-            pattern = re.compile(r"^\[Evidence\s+\d+\]\s*(?P<content>.+)$", re.IGNORECASE)
-            for line in observation.splitlines():
-                match = pattern.match(line.strip())
+            pattern = re.compile(
+                r"^\[Evidence\s+\d+\][ \t]*(?P<content>.*?)(?=^\[Evidence\s+\d+\]|\Z)",
+                re.IGNORECASE | re.MULTILINE | re.DOTALL,
+            )
+            for match in pattern.finditer(observation):
                 if match:
                     content = match.group("content").strip()
                     session_match = re.search(r"\[Session Date:\s*([^\]]+)\]", content, re.IGNORECASE)
                     session_date = ""
-                    normalized_time = ""
-                    relative_hint = ""
                     if session_match:
                         raw_session = session_match.group(1).strip()
                         session_date = self._normalize_tool_time_query(raw_session.split(" on ")[-1] if " on " in raw_session else raw_session)
-                        relative_match = re.search(
-                            r"\b(yesterday|today|tomorrow|last\s+\w+|next\s+\w+|two\s+\w+\s+ago|\w+\s+ago)\b",
-                            content,
-                            re.IGNORECASE,
-                        )
-                        if relative_match and session_date:
-                            relative_hint = relative_match.group(1).strip()
-                            try:
-                                from cogmem.memory.indexer import _resolve_relative_time
-                                normalized_time = _resolve_relative_time(relative_hint, session_date) or ""
-                            except Exception:
-                                normalized_time = ""
                     items.append({
                         "session_date": session_date,
-                        "relative_time": relative_hint,
-                        "normalized_time": normalized_time,
                         "content": content,
                     })
             return {"type": "evidence_chunks", "items": items[:6] or observation[:1800]}
@@ -2440,289 +2194,48 @@ class SearchAgent:
                 matched.append(entity)
         return matched
 
-    def _heuristic_multi_hop_answer(self, query: str, history: List[ThoughtActionObservation]) -> Optional[str]:
-        if self._current_question_type != "multi_hop":
-            return None
-        focus_terms = self._extract_focus_terms(query)
-        if not focus_terms:
-            return None
-        query_entities = [
-            token.lower()
-            for token in re.findall(r"\b[A-Z][a-z]+\b", query)
-            if token.lower() not in {"what", "when", "where", "which", "who", "how"}
-        ]
-        if len(query_entities) < 2:
-            return None
-
-        entity_term_map: Dict[str, set[str]] = {}
-        generic_terms = {
-            "like", "paint", "create", "have", "make", "find", "consider", "believe", "both",
-            "subject", "shared", "common", "thing", "fact", "event", "concept", "node"
-        }
-        preferred_terms = {"art", "painting", "landscape", "flower", "watercolor", "portrait"}
-
-        for step in history:
-            observation = step.observation or ""
-            for raw_line in observation.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                line_lower = line.lower()
-                matched_entities = [entity for entity in query_entities if entity in line_lower]
-                if not matched_entities:
-                    continue
-                tokens = set()
-                for token in re.findall(r"[A-Za-z0-9_]+", line_lower.replace("_", " ")):
-                    normalized = self._normalize_match_token(token)
-                    if len(normalized) < 3 or normalized in generic_terms:
-                        continue
-                    tokens.add(normalized)
-                if tokens:
-                    for entity in matched_entities:
-                        entity_term_map.setdefault(entity, set()).update(tokens)
-
-        if len(entity_term_map) < 2:
-            return self._conservative_multi_hop_answer(query, history) if self._requires_specific_shared_topic(query) else None
-
-        shared_terms = set.intersection(*entity_term_map.values())
-        if not shared_terms:
-            return self._conservative_multi_hop_answer(query, history) if self._requires_specific_shared_topic(query) else None
-
-        generic_shared_terms = {"art", "painting", "paint", "drawing", "draw", "create"}
-        if self._requires_specific_shared_topic(query):
-            theme_terms = {
-                term for term in self._shared_fact_theme_terms(history)
-                if term not in generic_shared_terms
-            }
-            if not theme_terms:
-                return self._conservative_multi_hop_answer(query, history)
-            shared_terms = shared_terms & theme_terms
-
-        ranked_terms = []
-        for term in shared_terms:
-            score = 0
-            if term in preferred_terms:
-                score += 3
-            if term in focus_terms:
-                score += 4
-            if term in {"art", "painting"}:
-                score += 2
-            ranked_terms.append((score, term))
-        ranked_terms.sort(reverse=True)
-        if not ranked_terms or ranked_terms[0][0] <= 0:
-            return self._conservative_multi_hop_answer(query, history) if self._requires_specific_shared_topic(query) else None
-
-        best_term = ranked_terms[0][1]
-        if self._requires_specific_shared_topic(query) and best_term in generic_shared_terms:
-            return self._conservative_multi_hop_answer(query, history)
-        if best_term == "art":
-            return "两人共同涉及的主题是绘画/艺术。"
-        if best_term == "painting":
-            return "两人共同画过的主题可以概括为绘画作品。"
-        return f"两人共同涉及的绘画主题是 {best_term}。"
-
-    def _heuristic_claim_answer(self, query: str, history: List[ThoughtActionObservation]) -> Optional[str]:
-        query_lower = query.lower()
-        if not any(keyword in query_lower for keyword in ["think", "feel", "believe", "opinion"]):
-            return None
-
-        people = [
-            token
-            for token in re.findall(r"\b[A-Z][a-z]+\b", query)
-            if token.lower() not in {"what", "when", "where", "which", "who", "how"}
-        ]
-        source_name = people[0] if people else "对方"
-        target_name = people[1] if len(people) > 1 else ""
-        focus_terms = self._extract_focus_terms(query)
-        topic_phrase = self._extract_claim_topic_phrase(query)
-
-        claim_candidates: List[Dict[str, Any]] = []
-        claim_line_pattern = re.compile(
-            r"^\d+\.\s+Claim:\s+(?P<source>.+?)\s+about\s+(?P<target>.+?):\s+(?P<content>.+?)(?:\s+\|\s+Sentiment:\s+(?P<sentiment>\w+))?(?:\s+\|\s+Session:\s+(?P<session>.+))?$",
-            re.IGNORECASE,
-        )
-        semantic_claim_pattern = re.compile(
-            r"^\[Score:\s*(?P<score>[0-9.]+)\]\s+Claim:\s+(?P<content>.+?)(?:\s+\|\s+Sentiment:\s+(?P<sentiment>\w+))?$",
-            re.IGNORECASE,
-        )
-
-        for step in history:
-            observation = step.observation or ""
-            for raw_line in observation.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                match = claim_line_pattern.match(line)
-                if match:
-                    content = match.group("content").strip()
-                    score = 1.5
-                    score += self._claim_topic_match_score(content.lower(), query_lower, focus_terms)
-                    claim_candidates.append({
-                        "content": content,
-                        "sentiment": match.group("sentiment") or "",
-                        "source": match.group("source").strip(),
-                        "target": match.group("target").strip(),
-                        "score": score,
-                        "kind": "claim_lookup",
-                    })
-                    continue
-
-                match = semantic_claim_pattern.match(line)
-                if match:
-                    content = match.group("content").strip()
-                    score = float(match.group("score") or 0.0)
-                    score += self._claim_topic_match_score(content.lower(), query_lower, focus_terms)
-                    claim_candidates.append({
-                        "content": content,
-                        "sentiment": match.group("sentiment") or "",
-                        "source": "",
-                        "target": "",
-                        "score": score,
-                        "kind": "semantic_claim",
-                    })
-
-        if not claim_candidates:
-            return None
-
-        def _candidate_rank(item: Dict[str, Any]) -> tuple[float, int]:
-            content_lower = item["content"].lower()
-            score = float(item["score"])
-            if focus_terms and any(term in content_lower for term in focus_terms):
-                score += 3.0
-            if target_name and target_name.lower() in content_lower:
-                score += 1.0
-            score += self._claim_topic_match_score(content_lower, query_lower, focus_terms)
-            if topic_phrase and item["kind"] == "claim_lookup" and self._claim_topic_match_score(content_lower, query_lower, focus_terms) <= 0:
-                score -= 4.0
-            kind_bonus = 1 if item["kind"] == "claim_lookup" else 0
-            return (score, kind_bonus)
-
-        claim_candidates.sort(key=_candidate_rank, reverse=True)
-        best = claim_candidates[0]
-        content = self._render_claim_content(best["content"].strip().rstrip("."))
-
-        if topic_phrase:
-            return f"{source_name}认为{target_name or '这件事'}的{topic_phrase}是{content}。"
-        if target_name:
-            return f"{source_name}认为{target_name}{content}。"
-        return f"{source_name}的看法是：{content}。"
-
-    def _extract_claim_topic_phrase(self, query: str) -> str:
-        query_lower = query.lower()
-        if "decision to adopt" in query_lower or "adoption" in query_lower:
-            return "收养决定"
-        if "think about" in query_lower:
-            return ""
-        return ""
-
-    def _claim_topic_match_score(self, content_lower: str, query_lower: str, focus_terms: set[str]) -> float:
-        score = 0.0
-        if focus_terms and any(term in content_lower for term in focus_terms):
-            score += 2.5
-        if "adopt" in query_lower or "adoption" in query_lower:
-            if any(token in content_lower for token in ["adopt", "family", "love", "accept", "giving back"]):
-                score += 5.0
-            else:
-                score -= 2.0
-        return score
-
-    def _render_claim_content(self, content: str) -> str:
-        normalized = content.strip()
-        lowered = normalized.lower()
-        phrase_map = {
-            "is a way of giving back and showing love and acceptance": "一种回馈他人、表达爱与接纳的方式",
-            "is a loving way to build a family": "一种充满爱地建立家庭的方式",
-            "makes me feel like maybe i should do it too": "甚至让她觉得自己或许也应该这么做",
-            "is so awesome": "很棒",
-            "you've got guts": "很有勇气",
-            "would be a great counselor": "会成为一名很棒的咨询师",
-            "empathy and understanding will help people": "她的同理心和理解力会帮助到别人",
-        }
-        for source, target in phrase_map.items():
-            if lowered == source:
-                return target
-        return normalized
-
-    def _tool_get_evidence(self, entity_id: str, limit: int = 3, query: str = None) -> str:
-        """Get original text evidence for an entity.
-        
-        P0 FIX: If entity has no evidence_span, try to get evidence from SUPPORTED_BY events.
-        This fixes the 83% bad cases issue where Facts have no evidence.
-        """
+    def _tool_get_evidence(self, entity_id: Optional[str] = None, limit: int = 3, query: str = None, entity_ids: Optional[List[str]] = None) -> str:
+        """Resolve graph addresses to original sources, then apply one shared read limit."""
         if not self.evidence_store:
             return "EvidenceStore not available. Cannot retrieve original text evidence."
-
+        if entity_ids is not None and (not isinstance(entity_ids,list) or any(not isinstance(node,str) or not node for node in entity_ids)):
+            return "Error retrieving evidence: entity_ids must be a list of nonempty node IDs."
+        if entity_id is not None and (not isinstance(entity_id,str) or not entity_id):
+            return "Error retrieving evidence: entity_id must be a nonempty node ID."
+        requested=list(dict.fromkeys(([entity_id] if entity_id else [])+(entity_ids or [])))
+        if not requested:
+            return "No graph node IDs provided for original source retrieval."
         try:
+            limit=max(1,int(limit))
+            pending=deque(requested);visited=set();scope=[]
+            graph_store=getattr(self.graph_service,'graph_store',None)
+            network=getattr(graph_store,'_g',None)
+            while pending:
+                node=pending.popleft()
+                if node in visited:continue
+                visited.add(node)
+                direct=self.evidence_store.get_chunks(node,limit=None)
+                if direct:
+                    scope.extend(direct)
+                    continue
+                # Follow only explicit provenance edges; never search unrelated raw history.
+                if network is not None and node in network:
+                    pending.extend(target for _,target,data in network.out_edges(node,data=True)
+                        if (data.get('rel_type') or data.get('relation_type'))=='SUPPORTED_BY' and target not in visited)
+            scope=list(dict.fromkeys(scope))
             if query:
-                chunks = self.evidence_store.get_chunks_by_query(
-                    entity_id,
-                    query,
-                    limit=limit,
-                    embedding_encoder=self.graph_service.embedding_encoder if hasattr(self.graph_service, "embedding_encoder") else None,
-                    chunk_store=self.graph_service.chunk_store if hasattr(self.graph_service, "chunk_store") else None,
-                )
+                chunks=self.evidence_store.rank_chunks(scope,query,limit=limit,
+                    embedding_encoder=getattr(self.graph_service,'embedding_encoder',None),
+                    chunk_store=getattr(self.graph_service,'chunk_store',None))
             else:
-                chunks = self.evidence_store.get_chunks(entity_id, limit=limit)
-        except Exception as e:
-            return f"Error retrieving evidence: {str(e)}"
-
-        # P0 FIX: If no direct evidence, try to get from SUPPORTED_BY events (for Facts)
+                chunks=scope[:limit]
+        except Exception as error:
+            return f"Error retrieving evidence: {str(error)}"
         if not chunks:
-            try:
-                node_data = self.graph_service.graph_store.get_node(entity_id)
-                if node_data and node_data.get('node_type') == 'fact':
-                    # Try to get evidence from supporting events
-                    supporting_event_ids = []
-                    
-                    # Try different graph structures
-                    if hasattr(self.graph_service.graph_store, '_g') and hasattr(self.graph_service.graph_store._g, 'out_edges'):
-                        # NetworkX graph
-                        for _, target_id, edge_data in self.graph_service.graph_store._g.out_edges(entity_id, data=True):
-                            rel_type = edge_data.get('relation_type') or edge_data.get('rel_type')
-                            if rel_type == 'SUPPORTED_BY':
-                                supporting_event_ids.append(target_id)
-                    elif hasattr(self.graph_service.graph_store, 'get_relations'):
-                        # Custom GraphStore
-                        relations = self.graph_service.graph_store.get_relations(entity_id, direction='out')
-                        for rel in relations:
-                            if rel.rel_type == 'SUPPORTED_BY':
-                                supporting_event_ids.append(rel.tail_id)
-                    
-                    # Get evidence from supporting events
-                    if supporting_event_ids:
-                        all_chunks = []
-                        for event_id in supporting_event_ids[:limit]:  # Limit to top N events
-                            try:
-                                if query:
-                                    event_chunks = self.evidence_store.get_chunks_by_query(
-                                        event_id,
-                                        query,
-                                        limit=2,
-                                        embedding_encoder=self.graph_service.embedding_encoder if hasattr(self.graph_service, "embedding_encoder") else None,
-                                        chunk_store=self.graph_service.chunk_store if hasattr(self.graph_service, "chunk_store") else None,
-                                    )
-                                else:
-                                    event_chunks = self.evidence_store.get_chunks(event_id, limit=2)
-                                if event_chunks:
-                                    all_chunks.extend(event_chunks)
-                            except:
-                                continue
-                        
-                        if all_chunks:
-                            chunks = all_chunks[:limit]  # Return top N chunks overall
-            except Exception as e:
-                # Log error but continue
-                import traceback
-                if hasattr(self, '_debug') and self._debug:
-                    print(f"[SearchAgent] Error in SUPPORTED_BY fallback: {e}")
-                    traceback.print_exc()
-                pass
-
-        if not chunks:
-            return f"No original text evidence found for entity: {entity_id}"
-
-        evidence_text = "\n".join([f"[Evidence {i+1}] {chunk}" for i, chunk in enumerate(chunks)])
-        return f"Original Text Evidence for {entity_id}:\n{evidence_text}"
+            return f"No original text evidence found for graph nodes: {requested}"
+        address=requested[0] if len(requested)==1 else json.dumps(requested,ensure_ascii=False)
+        evidence_text="\n".join(f"[Evidence {i+1}] {chunk}" for i,chunk in enumerate(chunks))
+        return f"Original Text Evidence for {address}:\n{evidence_text}"
 
     def _robust_find_anchors(self, query: str) -> Dict[str, List[str]]:
         """轻量锚点解析：提供候选 ID 供 LLM 提示"""

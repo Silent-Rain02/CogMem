@@ -14,7 +14,6 @@ Date: 2025-12
 
 from __future__ import annotations
 
-import re
 from typing import Dict, Tuple, Optional, Set
 from collections import defaultdict
 
@@ -138,64 +137,16 @@ class EntityMatcher:
                 merged = self._merge_person(existing_id, person)
                 return existing_id, merged
         
-        # 3. 创建新Person（生成稳定ID）
-        stable_id = self._generate_stable_id(canonical_name)
-        person.id = stable_id
+        # The graph builder has already assigned this identity to relations and
+        # source pointers. Replacing it here (formerly truncating names at 50
+        # characters) leaves those addresses dangling and can collide identities.
+        stable_id = person.id
         
         # 注册到索引
         self._register_person(stable_id, person)
         self._stats["created_new"] += 1
         
         return stable_id, person
-    
-    def _generate_stable_id(self, canonical_name: str) -> str:
-        """基于canonical_name生成稳定ID
-
-        算法：
-        1. 检测是否已经是person ID格式（p_xxx, person_xxx）
-        2. 如果是，提取并规范化核心部分
-        3. 如果不是，规范化名称并添加person_前缀
-
-        Args:
-            canonical_name: 规范名称（可能是"Jon"或"p_jon"或"person_jon"）
-
-        Returns:
-            稳定的Person ID（如 "person_jon"）
-        """
-        normalized = canonical_name.lower().strip()
-
-        # 情况1：已经是 'p_' 格式（如 "p_jon"）
-        if normalized.startswith('p_'):
-            # 提取 p_ 之后的部分
-            core = normalized[2:]  # 移除 'p_'
-            # 规范化核心部分
-            core = re.sub(r'[^a-z0-9]+', '_', core)
-            core = core.strip('_')
-            if len(core) > 50:
-                core = core[:50]
-            return f"p_{core}"
-
-        # 情况2：已经是 'person_' 格式（如 "person_jon"）
-        if normalized.startswith('person_'):
-            # 提取 person_ 之后的部分
-            core = normalized[7:]  # 移除 'person_'
-            # 规范化核心部分
-            core = re.sub(r'[^a-z0-9]+', '_', core)
-            core = core.strip('_')
-            if len(core) > 50:
-                core = core[:50]
-            return f"p_{core}"
-
-        # 情况3：普通名称（如 "Jon Smith"）
-        # 规范化：将非字母数字字符替换为下划线
-        normalized = re.sub(r'[^a-z0-9]+', '_', normalized)
-        normalized = normalized.strip('_')
-
-        # 限制长度（避免过长ID）
-        if len(normalized) > 50:
-            normalized = normalized[:50]
-
-        return f"p_{normalized}"
     
     def _register_person(self, person_id: str, person: Person) -> None:
         """注册Person到索引

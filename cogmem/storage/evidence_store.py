@@ -11,28 +11,30 @@ class EvidenceStore:
         self._processed_doc_ids: set[str] = set()
 
     def add_chunk_for_entity(self, entity_id: str, chunk: str) -> None:
-        """优化2: 增加chunk数量限制，改进chunk格式"""
-        arr = self._entity_to_chunks[entity_id]
-        if len(arr) < 15:  # 优化2: 从10个增加到15个，确保不会遗漏答案
-            # 优化2: 不要截断chunk，或者至少保留更多内容（从1000增加到1500）
-            arr.append(chunk[:1500])  # 保留更多内容，避免截断重要信息
+        """Retain complete source chunks; retrieval limits apply only when reading."""
+        self._entity_to_chunks[entity_id].append(chunk)
 
-    def get_chunks(self, entity_id: str, limit: int = 3) -> List[str]:
+    def get_chunks(self, entity_id: str, limit: int | None = 3) -> List[str]:
         """修复2: 简单的chunk检索（按顺序返回）"""
-        return self._entity_to_chunks.get(entity_id, [])[:limit]
+        return list(self._entity_to_chunks.get(entity_id, []))[:limit]
     
     def get_chunks_by_query(self, entity_id: str, query: str, limit: int = 5, embedding_encoder=None, chunk_store=None) -> List[str]:
-        """Query-aware chunk retrieval: use ChunkStore.search() when available, else re-embed entity chunks."""
-        chunks = self._entity_to_chunks.get(entity_id, [])
+        """Rank only the original sources referenced by this node."""
+        return self.rank_chunks(self.get_chunks(entity_id,limit=None),query,limit,embedding_encoder,chunk_store)
+
+    def rank_chunks(self, chunks: List[str], query: str, limit: int = 5, embedding_encoder=None, chunk_store=None) -> List[str]:
+        """Read-only ranking of an explicitly resolved provenance scope."""
+        chunks = list(dict.fromkeys(chunks))
         if not chunks:
             return []
         limit = max(1, int(limit))
 
-        # Prefer ChunkStore global search then filter by entity (avoids re-embedding all entity chunks)
+        # Scope must be applied before truncation: a global shortlist can starve
+        # a permitted source when unrelated documents rank above it.
         if embedding_encoder and chunk_store and chunk_store.size() > 0:
             try:
                 query_embedding = embedding_encoder.encode([query])[0]
-                candidate_results = chunk_store.search(query_embedding, top_k=min(max(limit * 3, limit), chunk_store.size()))
+                candidate_results = chunk_store.search_in_scope(query_embedding, set(chunks), top_k=limit)
                 entity_text_set = set(chunks)
                 sorted_chunks = []
                 for chunk, score in candidate_results:

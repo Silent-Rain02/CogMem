@@ -1,9 +1,4 @@
-"""Claim Reconciler Module
-
-This module implements Claim contradiction detection and temporal management.
-It detects conflicting Claims made by the same source about the same target
-and manages the evolution of Claims over time using SUPERSEDES relationships.
-"""
+"""Claim coexistence and contradiction diagnostics without automatic supersession."""
 
 from __future__ import annotations
 
@@ -15,23 +10,7 @@ from ..storage.graph_store import GraphStore
 from ..storage.schema import Claim, Relation, NodeTypeEnum, Metadata
 
 class ClaimReconciler:
-    """Claim Reconciler: Detects and manages conflicting Claims
-    
-    This class implements Claim contradiction detection and temporal management:
-    1. Group Claims by (source_id, target_id) pairs
-    2. Detect contradictions (sentiment reversal, content conflicts)
-    3. Establish temporal ordering using session_time
-    4. Create SUPERSEDES edges for claim evolution
-    
-    Usage:
-        reconciler = ClaimReconciler(graph_store)
-        
-        # Run full reconciliation
-        reconciler.run()
-        
-        # Or reconcile specific claims
-        contradictions = reconciler.find_contradictions()
-    """
+    """Preserve claims until same-context replacement is established by evidence."""
     
     # Sentiment pairs that indicate contradiction
     CONTRADICTING_SENTIMENTS = {
@@ -242,127 +221,18 @@ class ClaimReconciler:
         
         return sorted(claims, key=get_sort_key)
     
-    def establish_temporal_chain(
-        self,
-        groups: Dict[str, List[Tuple[str, Dict]]],
-        create_supersedes: bool = True
-    ) -> Dict[str, str]:
-        """Establish temporal chain for claims (newer supersedes older)
-        
-        Args:
-            groups: Claim groups from group_claims_by_source_target()
-            create_supersedes: Whether to create SUPERSEDES edges
-        
-        Returns:
-            Mapping from superseded claim IDs to superseding claim IDs
-        """
-        supersede_map: Dict[str, str] = {}
-        
-        for key, claims in groups.items():
-            if len(claims) < 2:
-                continue
-            
-            # Sort by time
-            sorted_claims = self._sort_claims_by_time(claims)
-            
-            # Create chain: newest supersedes second-newest, etc.
-            for i in range(len(sorted_claims) - 1):
-                older_id, older_data = sorted_claims[i]
-                newer_id, newer_data = sorted_claims[i + 1]
-                
-                # Record supersession
-                supersede_map[older_id] = newer_id
-                
-                if create_supersedes:
-                    # Create SUPERSEDES edge (newer -> older)
-                    supersedes_rel = Relation(
-                        head_id=newer_id,
-                        tail_id=older_id,
-                        rel_type='SUPERSEDES',
-                        weight=1.0,
-                        confidence=1.0
-                    )
-                    self.graph.add_relations([supersedes_rel])
-                    self._stats["supersedes_edges_created"] += 1
-                
-                # Archive older claim: is_archived, is_latest=False, memory_lifecycle=archived
-                if older_id in self.graph._g:
-                    self.graph._g.nodes[older_id]['is_archived'] = True
-                    self.graph._g.nodes[older_id]['is_latest'] = False
-                    self.graph._g.nodes[older_id]['memory_lifecycle'] = 'archived'
-                    self._stats["claims_archived"] += 1
-        
-        return supersede_map
-    
-    def reconcile_group(
-        self,
-        claims: List[Tuple[str, Dict]],
-        strategy: Literal['newest_wins', 'keep_all', 'merge'] = 'newest_wins'
-    ) -> Optional[str]:
-        """Reconcile a group of claims about the same (source, target)
-        
-        Args:
-            claims: List of claims to reconcile
-            strategy: Reconciliation strategy
-                - 'newest_wins': Keep only the newest claim
-                - 'keep_all': Keep all with temporal chain
-                - 'merge': Merge into single claim (not implemented)
-        
-        Returns:
-            ID of the canonical claim (if applicable)
-        """
-        if not claims:
-            return None
-        
-        if len(claims) == 1:
-            return claims[0][0]
-        
-        # Sort by time (newest last)
-        sorted_claims = self._sort_claims_by_time(claims)
-        
-        if strategy == 'newest_wins':
-            # Archive all but the newest
-            newest_id = sorted_claims[-1][0]
-            for claim_id, _ in sorted_claims[:-1]:
-                if claim_id in self.graph._g:
-                    self.graph._g.nodes[claim_id]['is_archived'] = True
-                    self.graph._g.nodes[claim_id]['is_latest'] = False
-                    self.graph._g.nodes[claim_id]['memory_lifecycle'] = 'archived'
-                    self._stats["claims_archived"] += 1
-            if newest_id in self.graph._g:
-                self.graph._g.nodes[newest_id]['is_latest'] = True
-                self.graph._g.nodes[newest_id]['memory_lifecycle'] = 'stable'
-            return newest_id
-        
-        elif strategy == 'keep_all':
-            # Just establish temporal chain
-            for i in range(len(sorted_claims) - 1):
-                older_id = sorted_claims[i][0]
-                newer_id = sorted_claims[i + 1][0]
-                
-                supersedes_rel = Relation(
-                    head_id=newer_id,
-                    tail_id=older_id,
-                    rel_type='SUPERSEDES',
-                    weight=1.0,
-                    confidence=1.0
-                )
-                self.graph.add_relations([supersedes_rel])
-                self._stats["supersedes_edges_created"] += 1
-            # Head of chain (newest) only: is_latest=True, memory_lifecycle=stable
-            head_id = sorted_claims[-1][0]
-            if head_id in self.graph._g:
-                self.graph._g.nodes[head_id]['is_latest'] = True
-                self.graph._g.nodes[head_id]['memory_lifecycle'] = 'stable'
-            return head_id
-        
-        # merge strategy not implemented
-        newest_id = sorted_claims[-1][0]
-        if newest_id in self.graph._g:
-            self.graph._g.nodes[newest_id]['is_latest'] = True
-            self.graph._g.nodes[newest_id]['memory_lifecycle'] = 'stable'
-        return newest_id
-    
+    def establish_temporal_chain(self, groups, create_supersedes=True):
+        """Temporal ordering alone cannot establish a same-context update."""
+        if not create_supersedes:
+            return {}
+        raise ValueError("Claim supersession requires source-backed context validation")
+
+    def reconcile_group(self, claims, strategy='keep_all'):
+        """Coexisting claims are preserved; automatic supersession is retired."""
+        if strategy != 'keep_all':
+            raise ValueError("Claim supersession requires source-backed context validation")
+        return claims[0][0] if len(claims) == 1 else None
+
     def run(
         self,
         create_supersedes: bool = True,
@@ -382,8 +252,12 @@ class ClaimReconciler:
         # Group claims
         groups = self.group_claims_by_source_target()
         
-        # Establish temporal chains
-        supersede_map = self.establish_temporal_chain(groups, create_supersedes=create_supersedes)
+        if strategy == 'keep_all':
+            supersede_map = {}
+        elif strategy == 'newest_wins':
+            supersede_map = self.establish_temporal_chain(groups, create_supersedes=create_supersedes)
+        else:
+            raise ValueError("Claim merging needs explicit source validation")
         
         # Find and log contradictions
         contradictions = self.find_contradictions()

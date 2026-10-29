@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,7 +58,7 @@ class OpenAICompatClient(LLMClient):
         self._api_key = api_key or self._cfg.model.api_key
         self._init_openai_client()
         self._chat_cache: LRUCache[str] = LRUCache(256)
-        self._embed_cache: LRUCache[Tuple[str, Tuple[str, ...]]] = LRUCache(128)
+        self._embed_cache: LRUCache[List[List[float]]] = LRUCache(128)
 
     def _init_openai_client(self) -> None:
         """初始化 OpenAI 客户端（子类可覆盖）"""
@@ -69,6 +70,7 @@ class OpenAICompatClient(LLMClient):
             base_url=self._base_url,
             api_key=self._api_key,
             http_client=http_client,
+            max_retries=0,  # One explicit retry layer (the decorators below).
         )
 
     def _get_chat_model(self, model: Optional[str] = None) -> Optional[str]:
@@ -82,7 +84,14 @@ class OpenAICompatClient(LLMClient):
     @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3))
     def chat(self, system: str, user: str, model: Optional[str] = None) -> str:
         mdl = self._get_chat_model(model)
-        key = f"{mdl}||{hash(system)}||{hash(user)}"
+        options = {}
+        if self._cfg.model.chat_max_tokens is not None:
+            if type(self._cfg.model.chat_max_tokens) is not int or self._cfg.model.chat_max_tokens < 1:
+                raise ValueError('chat_max_tokens must be positive')
+            options['max_tokens'] = self._cfg.model.chat_max_tokens
+        if self._cfg.model.chat_extra_body:
+            options['extra_body'] = dict(self._cfg.model.chat_extra_body)
+        key = (mdl, system, user, self._cfg.model.temperature, json.dumps(options, sort_keys=True))
         cached = self._chat_cache.get(key)
         if cached is not None:
             METRICS.record_chat(latency_ms=0.0, cache_hit=True)
@@ -95,6 +104,7 @@ class OpenAICompatClient(LLMClient):
                 {"role": "user", "content": user},
             ],
             temperature=self._cfg.model.temperature,
+            **options,
         )
         content = resp.choices[0].message.content or ""
         self._chat_cache.set(key, content)
@@ -117,19 +127,30 @@ class OpenAICompatClient(LLMClient):
     @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3))
     def embed(self, texts: List[str], model: Optional[str] = None) -> List[List[float]]:
         mdl = self._get_embedding_model(model)
-        key = (mdl, tuple(texts))
+        dimensions = self._cfg.model.embedding_dimensions
+        if dimensions is not None and (type(dimensions) is not int or dimensions < 1):
+            raise ValueError('embedding_dimensions must be positive')
+        key = (mdl, dimensions, tuple(texts))
         cached = self._embed_cache.get(key)
         if cached is not None:
             METRICS.record_embed(latency_ms=0.0, cache_hit=True)
             return cached  # type: ignore[return-value]
         start = time.time()
-        # OpenAI 兼容 API 限制每批最多 10 条
-        max_batch_size = 10
+        # Provider limits vary; honor the configured, verified request contract.
+        max_batch_size = self._cfg.runtime.embedding_batch_size
+        if max_batch_size < 1:
+            raise ValueError('embedding_batch_size must be positive')
         all_vectors: List[List[float]] = []
         for i in range(0, len(texts), max_batch_size):
             batch = texts[i : i + max_batch_size]
-            resp = self._client.embeddings.create(model=mdl, input=batch)
-            all_vectors.extend([d.embedding for d in resp.data])
+            options = {'dimensions': dimensions} if dimensions is not None else {}
+            resp = self._client.embeddings.create(model=mdl, input=batch, **options)
+            by_index = {item.index: item.embedding for item in resp.data}
+            if len(resp.data) != len(batch) or set(by_index) != set(range(len(batch))):
+                raise ValueError('Embedding response has missing or duplicate input indices')
+            if dimensions is not None and any(len(vector) != dimensions for vector in by_index.values()):
+                raise ValueError('Provider returned a different embedding dimension than requested')
+            all_vectors.extend(by_index[index] for index in range(len(batch)))
         vectors = all_vectors
         self._embed_cache.set(key, vectors)  # type: ignore[arg-type]
         latency_ms = (time.time() - start) * 1000.0

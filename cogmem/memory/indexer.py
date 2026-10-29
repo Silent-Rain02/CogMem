@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from copy import deepcopy
 import re
 from datetime import datetime, timedelta
 from typing import Iterable, List, Tuple, Dict, Optional, Any
@@ -21,6 +23,7 @@ from ..storage.typed_vector_store import TypedVectorStore
 from ..storage.evidence_store import EvidenceStore
 from ..storage.chunk_store import ChunkStore, Chunk
 from ..utils.json_utils import safe_json_loads
+from ..utils.temporal import normalize_event_time
 from ..utils.concept_manager import ConceptManager, get_default_manager
 from ..prompt import ATOMIC_EXTRACTION_SYSTEM, ATOMIC_EXTRACTION_USER
 from .entity_matcher import EntityMatcher
@@ -29,70 +32,7 @@ def _make_id(name: str) -> str:
     return hashlib.sha1(name.encode("utf-8")).hexdigest()
 
 def _resolve_relative_time(time_raw: str, session_time: str) -> Optional[str]:
-    """P0 FIX: Resolve relative time expressions to absolute ISO dates.
-    
-    This fixes the temporal question failure issue where "yesterday" is not resolved.
-    
-    Args:
-        time_raw: Raw time expression (e.g., "yesterday", "last week", "recently")
-        session_time: Session date/time in ISO format (e.g., "2023-01-20")
-    
-    Returns:
-        Resolved absolute time in ISO format, or None if cannot resolve
-    
-    Examples:
-        _resolve_relative_time("yesterday", "2023-01-20") -> "2023-01-19"
-        _resolve_relative_time("last week", "2023-01-20") -> "2023-01-13"
-        _resolve_relative_time("this month", "2023-01-20") -> "2023-01"
-    """
-    if not time_raw or not session_time:
-        return None
-    
-    time_lower = time_raw.lower().strip()
-    
-    # Parse session_time to get session_date
-    try:
-        # Handle both "YYYY-MM-DD" and "YYYY-MM-DDTHH:MM:SS" formats
-        session_date_str = session_time.split('T')[0] if 'T' in session_time else session_time
-        session_date = datetime.fromisoformat(session_date_str)
-    except (ValueError, AttributeError):
-        return None
-    
-    # Resolve relative expressions
-    if 'yesterday' in time_lower:
-        return (session_date - timedelta(days=1)).strftime("%Y-%m-%d")
-    elif 'today' in time_lower:
-        return session_date.strftime("%Y-%m-%d")
-    elif 'last week' in time_lower or 'a week ago' in time_lower:
-        return (session_date - timedelta(days=7)).strftime("%Y-%m-%d")
-    elif 'last month' in time_lower or 'a month ago' in time_lower:
-        # Approximate: 30 days ago
-        return (session_date - timedelta(days=30)).strftime("%Y-%m-%d")
-    elif 'this month' in time_lower or 'recently' in time_lower or 'lately' in time_lower:
-        # Return year-month only (fuzzy)
-        return session_date.strftime("%Y-%m")
-    elif 'this year' in time_lower:
-        return session_date.strftime("%Y")
-    elif 'last year' in time_lower:
-        return str(session_date.year - 1)
-    elif re.search(r'(\d+)\s*days?\s*ago', time_lower):
-        # "3 days ago", "5 day ago"
-        match = re.search(r'(\d+)\s*days?\s*ago', time_lower)
-        days = int(match.group(1))
-        return (session_date - timedelta(days=days)).strftime("%Y-%m-%d")
-    elif re.search(r'(\d+)\s*weeks?\s*ago', time_lower):
-        # "2 weeks ago"
-        match = re.search(r'(\d+)\s*weeks?\s*ago', time_lower)
-        weeks = int(match.group(1))
-        return (session_date - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
-    elif re.search(r'(\d+)\s*months?\s*ago', time_lower):
-        # "3 months ago" (approximate: 30 days per month)
-        match = re.search(r'(\d+)\s*months?\s*ago', time_lower)
-        months = int(match.group(1))
-        return (session_date - timedelta(days=months * 30)).strftime("%Y-%m-%d")
-    
-    # Cannot resolve
-    return None
+    return normalize_event_time(time_raw, session_time)
 
 class Indexer:
     """文档索引器：负责文档切分、实体抽取、关系抽取、向量索引和图存储"""
@@ -156,6 +96,17 @@ class Indexer:
             incremental: 是否执行增量索引
         """
         docs_to_process = list(docs)
+
+        # Validate source identity before incremental filtering or any writes.
+        # One ID cannot identify two different originals in the same batch.
+        source_texts = {}
+        for doc in docs_to_process:
+            if doc.id in source_texts and source_texts[doc.id] != doc.text:
+                raise ValueError(
+                    f"Conflicting source document id: {doc.id!r}. "
+                    "Use distinct document IDs or separate source namespaces/workspaces."
+                )
+            source_texts[doc.id] = doc.text
 
         if incremental:
             processed_doc_ids = self._evidence.get_processed_doc_ids()
@@ -236,7 +187,7 @@ class Indexer:
                         subject_title = self._parse_subject(chunk_texts[0])
                     
                     nodes, relations = self._build_event_mediated_graph(
-                        merged_result, session_id, session_time=session_date, session_date=session_date, subject_title=subject_title
+                        merged_result, session_id, session_time=session_date, session_date=session_date, subject_title=subject_title, source_id=doc.id
                     )
                     doc_nodes.extend(nodes)
                     doc_relations.extend(relations)
@@ -281,7 +232,7 @@ class Indexer:
                         subject_title = self._parse_subject(chunk_texts[0])
                     
                     nodes, relations = self._build_event_mediated_graph(
-                        merged_result, session_id, session_time=session_date, session_date=session_date, subject_title=subject_title
+                        merged_result, session_id, session_time=session_date, session_date=session_date, subject_title=subject_title, source_id=doc.id
                     )
                     doc_nodes.extend(nodes)
                     doc_relations.extend(relations)
@@ -796,9 +747,9 @@ class Indexer:
         if session_date:
             question_date_iso = session_date
 
-        # Use today's date if not provided
+        # Historical text without an anchor must not acquire the indexing date.
         if not question_date_iso:
-            question_date_iso = datetime.now().strftime("%Y-%m-%d")
+            question_date_iso = "unknown (do not resolve relative dates)"
 
         # Build user prompt with the chunk text and session date
         user_prompt = ATOMIC_EXTRACTION_USER.format(
@@ -829,220 +780,27 @@ class Indexer:
                         event["title"] = str(title).strip()
                     if "concepts" not in event or not isinstance(event.get("concepts"), list):
                         event["concepts"] = []
-                    time_raw = event.get("time")
-                    if time_raw and isinstance(time_raw, str):
-                        # CRITICAL FIX: Preserve fuzzy time - if normalization returns None, keep raw time
-                        normalized_time = self._normalize_relative_time(time_raw, session_date)
-                        # If normalization returned None (fuzzy time), keep the raw value
-                        # Otherwise, use normalized if it's different from raw
-                        if normalized_time is None:
-                            # Fuzzy time - keep raw value, will be handled in _build_event_mediated_graph
-                            pass  # Keep event["time"] as raw value
-                        elif normalized_time != time_raw:
-                            event["time"] = normalized_time
-                        # If normalized_time == time_raw, it's already in correct format
+                    # Keep the extracted expression unchanged. Resolve once at graph construction.
                 normalized_events.append(event)
             extraction_result["events"] = normalized_events
 
         return extraction_result
 
-    def _normalize_evidence_token(self, token: str) -> str:
-        token = re.sub(r"[^a-z0-9]+", "", str(token or "").lower())
-        if len(token) > 5 and token.endswith("ing"):
-            token = token[:-3]
-        elif len(token) > 4 and token.endswith("ed"):
-            token = token[:-2]
-        elif len(token) > 4 and token.endswith("es"):
-            token = token[:-2]
-        elif len(token) > 3 and token.endswith("s"):
-            token = token[:-1]
-        return token
-
-    def _text_token_set(self, text: str) -> set[str]:
-        tokens = set()
-        for raw in re.findall(r"[A-Za-z0-9_]+", str(text or "").lower()):
-            normalized = self._normalize_evidence_token(raw)
-            if normalized and len(normalized) >= 3:
-                tokens.add(normalized)
-        return tokens
-
-    def _node_evidence_terms(
-        self,
-        node: Any,
-        person_name_map: Dict[str, str],
-        concept_name_map: Dict[str, str],
-    ) -> Dict[str, Any]:
-        if isinstance(node, Event):
-            participant_names = [person_name_map.get(pid, "") for pid in node.participants]
-            concept_names = [concept_name_map.get(cid, "") for cid in node.concepts]
-            text_fields = [node.title, node.description, node.content, node.time_start_raw, node.session_time]
-            core_text_fields = [node.title, node.description, node.content, node.time_start_raw]
-            return {
-                "phrases": [field for field in text_fields if field],
-                "tokens": self._text_token_set(" ".join(field for field in text_fields if field)),
-                "core_tokens": self._text_token_set(" ".join(field for field in core_text_fields if field)),
-                "participants": [name for name in participant_names if name],
-                "concepts": [name for name in concept_names if name],
-                "session_time": node.session_time or "",
-            }
-
-        if isinstance(node, Fact):
-            subject_name = person_name_map.get(node.subject_id, node.subject_id)
-            object_name = concept_name_map.get(node.object_id or "", node.object_id or "")
-            purpose_name = concept_name_map.get(node.purpose_id or "", node.purpose_id or "")
-            text_fields = [node.content, node.predicate, subject_name, object_name, purpose_name, node.session_time]
-            core_text_fields = [node.content, node.predicate, object_name, purpose_name]
-            return {
-                "phrases": [field for field in text_fields if field],
-                "tokens": self._text_token_set(" ".join(field for field in text_fields if field)),
-                "core_tokens": self._text_token_set(" ".join(field for field in core_text_fields if field)),
-                "participants": [subject_name] if subject_name else [],
-                "concepts": [name for name in [object_name, purpose_name] if name],
-                "session_time": node.session_time or "",
-            }
-
-        if isinstance(node, Claim):
-            source_name = person_name_map.get(node.source_id, node.source_id)
-            target_name = person_name_map.get(node.target_id, concept_name_map.get(node.target_id, node.target_id))
-            text_fields = [node.content, source_name, target_name, node.session_time]
-            return {
-                "phrases": [field for field in text_fields if field],
-                "tokens": self._text_token_set(" ".join(field for field in text_fields if field)),
-                "core_tokens": self._text_token_set(node.content),
-                "participants": [name for name in [source_name, target_name] if name],
-                "concepts": [],
-                "session_time": node.session_time or "",
-            }
-
-        if isinstance(node, Person):
-            person_name = node.canonical_name or node.content or ""
-            return {
-                "phrases": [person_name],
-                "tokens": self._text_token_set(person_name),
-                "core_tokens": self._text_token_set(person_name),
-                "participants": [person_name] if person_name else [],
-                "concepts": [],
-                "session_time": getattr(node, "session_time", "") or "",
-            }
-
-        if isinstance(node, Concept):
-            concept_name = node.name or node.content or ""
-            return {
-                "phrases": [concept_name],
-                "tokens": self._text_token_set(concept_name),
-                "core_tokens": self._text_token_set(concept_name),
-                "participants": [],
-                "concepts": [concept_name] if concept_name else [],
-                "session_time": "",
-            }
-
-        content = getattr(node, "content", "") or ""
-        return {
-            "phrases": [content] if content else [],
-            "tokens": self._text_token_set(content),
-            "core_tokens": self._text_token_set(content),
-            "participants": [],
-            "concepts": [],
-            "session_time": getattr(node, "session_time", "") or "",
-        }
-
-    def _score_chunk_for_node(
-        self,
-        node: Any,
-        chunk_text: str,
-        person_name_map: Dict[str, str],
-        concept_name_map: Dict[str, str],
-    ) -> float:
-        terms = self._node_evidence_terms(node, person_name_map, concept_name_map)
-        chunk_lower = str(chunk_text or "").lower()
-        chunk_tokens = self._text_token_set(chunk_text)
-        score = 0.0
-        lexical_score = 0.0
-
-        for phrase in terms["phrases"]:
-            phrase_lower = str(phrase).lower().strip()
-            if not phrase_lower:
-                continue
-            if len(phrase_lower) >= 12 and phrase_lower in chunk_lower:
-                lexical_score += 6.0
-
-        core_overlap = terms.get("core_tokens", set()) & chunk_tokens
-        lexical_score += min(len(core_overlap), 8) * 1.2
-        score += lexical_score
-
-        if lexical_score > 0 or isinstance(node, Person):
-            for participant in terms["participants"]:
-                participant_lower = str(participant).lower().strip()
-                if participant_lower and participant_lower in chunk_lower:
-                    score += 1.5
-
-            for concept in terms["concepts"]:
-                concept_lower = str(concept).lower().strip()
-                if concept_lower and concept_lower in chunk_lower:
-                    score += 1.5
-
-        node_session = terms["session_time"]
-        chunk_session = self._parse_session_date(chunk_text)
-        if lexical_score > 0 and node_session and chunk_session and node_session == chunk_session:
-            score += 3.0
-
-        if isinstance(node, Event):
-            if node.time_start_raw and str(node.time_start_raw).lower() in chunk_lower:
-                score += 3.0
-            if node.time_start and str(node.time_start) in chunk_lower:
-                score += 3.0
-
-        if isinstance(node, Fact) and node.predicate:
-            pred_tokens = self._text_token_set(node.predicate.replace("_", " "))
-            score += min(len(pred_tokens & chunk_tokens), 3) * 1.5
-
-        if isinstance(node, Claim) and node.content and str(node.content).lower() in chunk_lower:
-            score += 4.0
-
-        return score
-
     def _attach_relevant_evidence_chunks(self, nodes: List[Any], doc_chunks: List[Chunk]) -> None:
-        person_name_map = {
-            node.id: node.canonical_name
-            for node in nodes
-            if isinstance(node, Person) and getattr(node, "canonical_name", "")
-        }
-        concept_name_map = {
-            node.id: node.name
-            for node in nodes
-            if isinstance(node, Concept) and getattr(node, "name", "")
-        }
+        """Register document-level provenance from extraction, never lexical guesses.
 
+        The caller knows which document produced these nodes. Keep every source
+        chunk as a recoverable address; query-aware read limits select the view.
+        """
         for node in nodes:
-            node_id = node.id if hasattr(node, "id") else None
+            node_id = getattr(node, 'id', None)
             if not node_id:
                 continue
-
-            scored_chunks: List[Tuple[float, str]] = []
+            existing = set(self._evidence.get_chunks(node_id, limit=None))
             for chunk in doc_chunks:
-                score = self._score_chunk_for_node(node, chunk.text, person_name_map, concept_name_map)
-                if score > 0:
-                    scored_chunks.append((score, chunk.text))
-
-            scored_chunks.sort(key=lambda item: item[0], reverse=True)
-
-            selected: List[str] = []
-            for score, text in scored_chunks[:4]:
-                if score < 2.0:
-                    continue
-                if text not in selected:
-                    selected.append(text)
-
-            if not selected and isinstance(node, Person):
-                for chunk in doc_chunks:
-                    person_name = person_name_map.get(node_id, "")
-                    if person_name and person_name.lower() in chunk.text.lower() and chunk.text not in selected:
-                        selected.append(chunk.text)
-                    if len(selected) >= 3:
-                        break
-
-            for text in selected:
-                self._evidence.add_chunk_for_entity(node_id, text)
+                if chunk.text not in existing:
+                    self._evidence.add_chunk_for_entity(node_id, chunk.text)
+                    existing.add(chunk.text)
 
     @property
     def evidence(self) -> EvidenceStore:
@@ -1151,211 +909,8 @@ class Indexer:
             return match.group(1).strip()
         return None
 
-    def _normalize_relative_time(self, time_str: str, session_date: str) -> str:
-        """Normalize relative time expressions to absolute ISO format
-
-        Handles relative dates like "yesterday", "today", "tomorrow", etc.
-        by calculating actual dates based on session_date.
-
-        Args:
-            time_str: Relative time string from LLM extraction (e.g., "yesterday")
-            session_date: ISO date of the session (e.g., "2023-05-15")
-
-        Returns:
-            Normalized ISO date string
-        """
-        # datetime and timedelta are imported at the top of the file
-
-        if not time_str or not isinstance(time_str, str):
-            return "XXXX-XX-XX"
-
-        # Normalize input
-        time_str = time_str.strip().lower()
-
-        # Already in valid format, return as-is
-        if 'XXXX' in time_str or ('XX' in time_str and time_str.upper() != 'XX'):
-            return time_str
-
-        # Handle fully unknown dates
-        if not time_str or time_str in ["unknown", "none", "null", "n/a", "na", "unspecified"]:
-            return "XXXX-XX-XX"
-
-        # P0 FIX: 处理纯年份格式（如"2022"）
-        if re.match(r'^\d{4}$', time_str):
-            year = int(time_str)
-            if 1900 <= year <= 2100:
-                return f"{year}-01-01"  # 标准化为YYYY-01-01格式
-            else:
-                return None  # 无效年份
-
-        # CRITICAL FIX: Do NOT convert fuzzy time to "XXXX-XX-XX" here
-        # The caller should handle fuzzy time by keeping time_start as None
-        # and preserving time_start_raw. This method should only normalize
-        # relative dates that can be resolved (yesterday, today, etc.)
-        
-        # Handle fuzzy time expressions - return None to signal that it should be preserved
-        # First check exact match (fast path)
-        if time_str in ["recently", "recent", "lately", "sometime", "sometimes", "earlier", "before"]:
-            return None  # Signal to caller: preserve as fuzzy time
-
-        # Then check if contains any fuzzy time keywords (e.g., "recently/lately", "sometime recently")
-        # This handles cases where LLM outputs combined expressions
-        fuzzy_keywords = ["recently", "lately", "sometime", "sometimes", "earlier", "before"]
-        for keyword in fuzzy_keywords:
-            if keyword in time_str:
-                return None  # Signal to caller: preserve as fuzzy time
-
-        # Parse session date
-        try:
-            session_dt = datetime.strptime(session_date, "%Y-%m-%d")
-        except ValueError:
-            # Try alternative formats
-            try:
-                session_dt = datetime.strptime(session_date, "%Y-%m")
-                # If only month, use 15th as middle of month
-                session_dt = session_dt.replace(day=15)
-            except ValueError:
-                try:
-                    session_dt = datetime.strptime(session_date, "%Y")
-                    # If only year, use June 15 as middle of year
-                    session_dt = session_dt.replace(month=6, day=15)
-                except ValueError:
-                    # Cannot parse session date, return unknown
-                    return "XXXX-XX-XX"
-
-        # P0 FIX: 处理"session-time: YYYY-MM-DD, last year"格式
-        # 提取session-time和相对时间表达式
-        if "session-time:" in time_str or "session time:" in time_str.lower():
-            # 格式: "session-time: 2023-05-08, last year"
-            parts = re.split(r'[,;]', time_str, 1)
-            if len(parts) == 2:
-                session_part = parts[0].strip()
-                relative_part = parts[1].strip()
-                # 提取session date
-                session_match = re.search(r'(\d{4}-\d{2}-\d{2})', session_part)
-                if session_match:
-                    session_date = session_match.group(1)
-                    try:
-                        session_dt = datetime.strptime(session_date, "%Y-%m-%d")
-                        # 递归处理相对时间部分
-                        return self._normalize_relative_time(relative_part, session_date)
-                    except ValueError:
-                        pass
-        
-        # Resolve relative dates
-        if time_str == "yesterday":
-            return (session_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-        elif time_str == "today":
-            return session_dt.strftime("%Y-%m-%d")
-        elif time_str == "tomorrow":
-            return (session_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        elif time_str == "last week":
-            return (session_dt - timedelta(days=7)).strftime("%Y-%m-%d")
-        elif time_str == "next week":
-            return (session_dt + timedelta(days=7)).strftime("%Y-%m-%d")
-        elif time_str == "last month":
-            # Go back one month, approximate
-            month = session_dt.month - 1
-            year = session_dt.year
-            if month <= 0:
-                month = 12
-                year -= 1
-            return f"{year}-{month:02d}-XX"
-        elif time_str == "next month":
-            # Go forward one month, approximate
-            month = session_dt.month + 1
-            year = session_dt.year
-            if month > 12:
-                month = 1
-                year += 1
-            return f"{year}-{month:02d}-XX"
-        # P0 FIX: 处理"last year"和"X years ago"
-        elif time_str == "last year":
-            year = session_dt.year - 1
-            return f"{year}-XX-XX"
-        elif "years ago" in time_str or "year ago" in time_str:
-            # 匹配"2 years ago", "1 year ago"等
-            years_match = re.search(r'(\d+)\s*(?:years?|year)\s+ago', time_str)
-            if years_match:
-                years = int(years_match.group(1))
-                year = session_dt.year - years
-                return f"{year}-XX-XX"
-        elif "months ago" in time_str or "month ago" in time_str:
-            # 匹配"3 months ago"等
-            months_match = re.search(r'(\d+)\s*(?:months?|month)\s+ago', time_str)
-            if months_match:
-                months = int(months_match.group(1))
-                target_dt = session_dt - timedelta(days=months * 30)  # 近似
-                return target_dt.strftime("%Y-%m-XX")
-
-        # If not a relative expression, try to parse natural language dates
-        # CRITICAL FIX: Support formats like "19 January, 2023", "January 2023", etc.
-        try:
-            # Try parsing natural language dates using dateutil if available
-            try:
-                from dateutil import parser as date_parser
-                # Parse natural language date
-                parsed_date = date_parser.parse(time_str, default=session_dt if 'session_dt' in locals() else datetime.now())
-                return parsed_date.strftime("%Y-%m-%d")
-            except ImportError:
-                # dateutil not available, use manual parsing
-                pass
-            except (ValueError, TypeError):
-                # dateutil failed, try manual parsing
-                pass
-            
-            # Manual parsing for common formats
-            # Pattern: "DD Month, YYYY" or "Month DD, YYYY" or "DD Month YYYY"
-            month_names = {
-                'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
-                'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
-                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
-            }
-            
-            # Pattern: "19 January, 2023" or "January 19, 2023" or "19 January 2023"
-            # Note: re is already imported at the top of the file
-            date_patterns = [
-                r'(\d{1,2})\s+(\w+),?\s+(\d{4})',  # "19 January, 2023" or "19 January 2023"
-                r'(\w+)\s+(\d{1,2}),?\s+(\d{4})',  # "January 19, 2023" or "January 19 2023"
-            ]
-            
-            for pattern in date_patterns:
-                match = re.search(pattern, time_str, re.IGNORECASE)
-                if match:
-                    groups = match.groups()
-                    if len(groups) == 3:
-                        # Determine which is day and which is month
-                        if groups[0].isdigit():
-                            day, month_str, year = int(groups[0]), groups[1].lower(), int(groups[2])
-                        else:
-                            month_str, day, year = groups[0].lower(), int(groups[1]), int(groups[2])
-                        
-                        month = month_names.get(month_str)
-                        if month and 1 <= day <= 31 and 1900 <= year <= 2100:
-                            return f"{year}-{month:02d}-{day:02d}"
-            
-            # Pattern: "January 2023" or "Jan 2023" (month and year only)
-            month_year_pattern = r'(\w+)\s+(\d{4})'
-            match = re.search(month_year_pattern, time_str, re.IGNORECASE)
-            if match:
-                month_str, year = match.groups()
-                month = month_names.get(month_str.lower())
-                if month and 1900 <= int(year) <= 2100:
-                    # Return YYYY-MM format (partial date)
-                    return f"{year}-{month:02d}"
-            
-            # Try parsing as ISO format
-            if 'T' in time_str:
-                datetime.fromisoformat(time_str.replace('Z', '+00:00'))
-            else:
-                datetime.strptime(time_str, "%Y-%m-%d")
-            # If successful, return as-is
-            return time_str
-        except:
-            # Not a valid date format, return None to preserve raw text
-            # CRITICAL: Don't return "XXXX-XX-XX" - let caller preserve original text
-            return None
+    def _normalize_relative_time(self, time_str: str, session_date: str) -> Optional[str]:
+        return normalize_event_time(time_str, session_date)
 
     def _build_event_mediated_graph(
         self,
@@ -1363,7 +918,8 @@ class Indexer:
         session_id: Optional[str] = None,
         session_time: Optional[str] = None,
         session_date: Optional[str] = None,
-        subject_title: Optional[str] = None
+        subject_title: Optional[str] = None,
+        source_id: Optional[str] = None
     ) -> Tuple[List, List]:
         """Build graph using the new P-E-C-F architecture with Claims and Concepts
 
@@ -1375,6 +931,7 @@ class Indexer:
         
         **ROOT FIX: Speaker Identity Resolution & Subject Title Resolution**
         """
+        extraction_result = deepcopy(extraction_result)
         nodes_to_add = []
         relations_to_add = []
 
@@ -1592,6 +1149,7 @@ class Indexer:
                     content=f"Person: {canonical_name}",
                     session_time=session_time,  # Session time for temporal reasoning
                     metadata=Metadata(
+                    source=source_id or session_id,
                         created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     )
                 )
@@ -1633,6 +1191,7 @@ class Indexer:
                             description=f"Concept: {concept_name}",
                             content=f"Concept: {concept_name}",
                             metadata=Metadata(
+                    source=source_id or session_id,
                                 created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             )
                         )
@@ -1667,69 +1226,7 @@ class Indexer:
             else:
                 time_start_raw = None
             
-            # Try to normalize time, but preserve fuzzy time if normalization fails
-            time_normalized = None
-            if time_start_raw:
-                # Check if it's a fuzzy time expression (should be preserved, not overwritten)
-                time_raw_lower = str(time_start_raw).strip().lower()
-                fuzzy_keywords = ["recently", "recent", "lately", "sometime", "sometimes", "earlier", "before"]
-                is_fuzzy_time = any(keyword in time_raw_lower for keyword in fuzzy_keywords)
-                
-                if is_fuzzy_time:
-                    # CRITICAL: Do NOT normalize fuzzy time to "XXXX-XX-XX"
-                    # Keep time_start as None, but preserve time_start_raw
-                    time_normalized = None
-                # P0 FIX: 支持纯年份格式（如"2022"）
-                elif re.match(r'^\d{4}$', str(time_start_raw)):
-                    # 纯年份格式，如"2022"，标准化为YYYY-01-01
-                    year = int(time_start_raw)
-                    if 1900 <= year <= 2100:
-                        time_normalized = f"{year}-01-01"
-                    else:
-                        # 无效年份，保持为None
-                        time_normalized = None
-                elif not re.match(r'^\d{4}-\d{2}-\d{2}', str(time_start_raw)) and not re.match(r'^\d{4}-\d{2}$', str(time_start_raw)):
-                    # P0 FIX: Try new _resolve_relative_time function first
-                    # This fixes temporal questions by resolving "yesterday", "last week", etc.
-                    effective_session_date = session_date or session_time or "2023-01-01"
-                    resolved = _resolve_relative_time(str(time_start_raw), effective_session_date)
-                    
-                    if resolved:
-                        # Successfully resolved relative time to absolute date
-                        time_normalized = resolved
-                    else:
-                        # Fall back to old normalization method
-                        normalized = self._normalize_relative_time(str(time_start_raw), effective_session_date)
-                        # CRITICAL FIX: normalized can be None (fuzzy time or parsing failed), 
-                        # a valid ISO date string, or "XXXX-XX-XX" (should not happen now)
-                        if normalized and normalized != "XXXX-XX-XX" and normalized is not None:
-                            time_normalized = normalized
-                        # If normalization returned None (fuzzy time or parsing failed),
-                        # preserve session-time in time_start_raw for temporal reasoning
-                        if normalized is None and session_time:
-                            # Format: "session-time: YYYY-MM-DD, this month"
-                            time_start_raw = f"session-time: {session_time}, {time_start_raw}"
-                elif re.match(r'^\d{4}-\d{2}$', str(time_start_raw)):
-                    # Partial date like "2023-01" - keep as is
-                    time_normalized = time_start_raw
-                else:
-                    # Already in ISO format (YYYY-MM-DD)
-                    time_normalized = time_start_raw
-            
-            # ROOT FIX: Temporal Hallucination Prevention (based on session_date, not system date)
-            # If time_start matches session_date AND text doesn't explicitly say "today",
-            # set it to None (we prefer "unknown time" over "wrong time")
-            # This prevents LLM from hallucinating "today" when processing historical data
-            if time_normalized and session_date:
-                # Use session_date instead of current system date for more accurate detection
-                # This ensures that historical documents are processed correctly
-                if time_normalized == session_date:
-                    # Check if the raw time explicitly says "today"
-                    time_raw_lower = str(time_start_raw or "").strip().lower()
-                    if "today" not in time_raw_lower:
-                        # This is likely a hallucination - set to None
-                        time_normalized = None
-                        # Keep time_start_raw as is (preserve original text)
+            time_normalized = normalize_event_time(time_start_raw, session_date or session_time)
 
             # P0 FIX 1.1: 事件验证和完整性检查
             # 检查事件是否完整：至少需要标题和至少一个参与者
@@ -1738,24 +1235,6 @@ class Indexer:
                     print(f"  [Indexer] [WARN] 跳过不完整事件: title={title}, participants={len(participant_ids)}")
                 continue  # 跳过不完整的事件
             
-            # P0 FIX 1.1: 时间信息验证和增强
-            # 如果时间信息缺失或模糊，尝试从session_time推断
-            if not time_start_raw and not time_normalized and session_time:
-                # 如果完全没有时间信息，使用session_time作为fallback
-                time_start_raw = f"session-time: {session_time}"
-                time_normalized = None  # 保持为None，因为这是推断的时间
-            
-            # P0 FIX 1.1: 对于模糊时间，如果session_time可用，添加session-time上下文
-            if time_start_raw and time_normalized is None:
-                # 模糊时间（如"recently"），如果有session_time，添加上下文
-                if session_time and "session-time:" not in str(time_start_raw):
-                    time_start_raw = f"session-time: {session_time}, {time_start_raw}"
-            
-            # CRITICAL FIX: Ensure at least one time field is set
-            # If all time fields are None, set time_start_raw to "unknown" to satisfy validation
-            if not time_start_raw and not time_normalized:
-                time_start_raw = "unknown"
-
             # CRITICAL FIX: Enhance event title and content with more context
             # Build richer description from event data
             description_parts = [title]
@@ -1767,7 +1246,8 @@ class Indexer:
             enhanced_description = ". ".join(description_parts)
 
             # Create Event node with both raw and normalized times
-            event_id = f"event_{_make_id(title)}"
+            occurrence = json.dumps([source_id or session_id, session_time, sorted(participant_ids), title, time_start_raw, i], ensure_ascii=False)
+            event_id = f"event_{_make_id(occurrence)}"
             event = Event(
                 id=event_id,
                 title=title,
@@ -1775,11 +1255,13 @@ class Indexer:
                 concepts=concept_ids,
                 time_start=time_normalized,  # None if fuzzy time or parsing failed
                 time_start_raw=time_start_raw,  # Always preserve original raw time (must be string)
+                granularity=("year" if len(time_normalized) == 4 else "month" if len(time_normalized) == 7 else "day") if time_normalized else None,
                 time_resolved=time_normalized,  # P0 FIX: Store resolved time from _resolve_relative_time
                 session_time=session_time,  # Session time for temporal reasoning
                 content=f"Event: {enhanced_description}",  # Enhanced with time and context
                 description=enhanced_description,  # Add description field for better retrieval
                 metadata=Metadata(
+                    source=source_id or session_id,
                     created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
             )
@@ -1792,20 +1274,12 @@ class Indexer:
                 continue  # 跳过无效事件
             
             nodes_to_add.append(event)
-            # 建立人员参与边：Person -> Event
-            # CRITICAL FIX: Distinguish primary participant from secondary participants
-            # First participant is typically the PRIMARY actor (the one doing the action)
-            for idx, pid in enumerate(participant_ids):
-                if idx == 0:
-                    # First participant is PRIMARY (main actor in the event)
-                    rel_type = "PARTICIPATED_IN"
-                    weight = 1.0
-                else:
-                    # Other participants are SECONDARY (mentioned or co-participants)
-                    # Use MENTIONED_IN for lower relevance in retrieval
-                    rel_type = "MENTIONED_IN"
-                    weight = 0.5  # Lower weight for mentioned participants
-                
+            # The extraction contract lists participants, not ranked roles.
+            # Array order is not evidence that later people were mere mentions.
+            for pid in participant_ids:
+                rel_type = "PARTICIPATED_IN"
+                weight = 1.0
+
                 event_relations.append(
                     Relation(
                         head_id=pid,
@@ -1859,6 +1333,7 @@ class Indexer:
                         description=f"Concept: {object_name}",
                         content=f"Concept: {object_name}",
                         metadata=Metadata(
+                    source=source_id or session_id,
                             created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         )
                     )
@@ -1881,6 +1356,7 @@ class Indexer:
                         description=f"Concept: {purpose_name}",
                         content=f"Concept: {purpose_name}",
                         metadata=Metadata(
+                    source=source_id or session_id,
                             created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         )
                     )
@@ -1900,7 +1376,7 @@ class Indexer:
                     object_id = self._concept_manager.resolve("unknown")  # Use concept_manager to avoid double prefix
 
             # Create Fact node
-            fact_id = f"fact_{_make_id(f'{subject}_{predicate}_{object_name or purpose_name}')}"
+            fact_id = "fact_" + _make_id(json.dumps([source_id or session_id, session_time, subject, predicate, object_name or purpose_name, fact_data.get("content"), i], ensure_ascii=False))
             
             # ===== P0 FIX 1.2: 构建自然语言的content字段用于向量检索 =====
             # 1. 获取subject的自然语言名称
@@ -1977,11 +1453,21 @@ class Indexer:
                 confidence=1.0,
                 session_time=session_time,  # Session time for temporal reasoning
                 metadata=Metadata(
+                    source=source_id or session_id,
                     created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 ),
                 memory_lifecycle=MemoryLifecycle.CANDIDATE,  # Indexing facts are candidates until consolidated
             )
             nodes_to_add.append(fact)
+            # The reified Fact carries its own source and occurrence identity.
+            # A subject-to-object shortcut cannot make that Fact reachable.
+            fact_relations.append(Relation(
+                head_id=subject_id,
+                tail_id=fact_id,
+                rel_type="HAS_ATTRIBUTE",
+                weight=1.0,
+                confidence=fact.confidence,
+            ))
             # 关系映射：将自然谓词映射到图边类型
             pred_norm = (predicate or "").lower()
             if pred_norm in ["loves", "love", "likes", "like", "enjoys", "enjoy"]:
@@ -2025,8 +1511,8 @@ class Indexer:
             if not source or not target or not content:
                 continue
 
-            # Get source ID (must be a person)
-            source_id = person_map.get(source, f"p_{source.lower().replace(' ', '_')}")
+            # Speaker identity and extraction-document provenance are separate.
+            source_person_id = person_map.get(source, f"p_{source.lower().replace(' ', '_')}")
 
             # Resolve target (could be person or concept)
             # ROOT FIX: Strip c_ prefix if LLM already added it (to avoid c_c_xxx)
@@ -2049,6 +1535,7 @@ class Indexer:
                             description=f"Concept: {clean_target}",
                             content=f"Concept: {clean_target}",
                             metadata=Metadata(
+                    source=source_id or session_id,
                                 created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             )
                         )
@@ -2070,6 +1557,7 @@ class Indexer:
                             description=f"Concept: {target}",
                             content=f"Concept: {target}",
                             metadata=Metadata(
+                    source=source_id or session_id,
                                 created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             )
                         )
@@ -2077,16 +1565,17 @@ class Indexer:
                         created_concept_ids.add(target_id)
 
             # Create Claim node
-            claim_id = f"claim_{_make_id(f'{source}_{target}_{content}')}"
+            claim_id = "claim_" + _make_id(json.dumps([source_id or session_id, session_time, source, target, content, i], ensure_ascii=False))
             claim = Claim(
                 id=claim_id,
-                source_id=source_id,
+                source_id=source_person_id,
                 target_id=target_id,
                 content=content,
                 sentiment=sentiment,
                 confidence=0.8,  # Claims have lower confidence than facts
                 session_time=session_time,  # Session time for temporal reasoning
                 metadata=Metadata(
+                    source=source_id or session_id,
                     created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
             )
@@ -2094,7 +1583,7 @@ class Indexer:
 
             # Create CLAIMS edge: Source -> Claim
             rel_claims = Relation(
-                head_id=source_id,
+                head_id=source_person_id,
                 tail_id=claim_id,
                 rel_type="CLAIMS",
                 weight=1.0,
@@ -2173,7 +1662,7 @@ class Indexer:
         print(f"  正在生成节点向量（共 {len(node_texts)} 个节点，这可能需要几分钟）...")
         try:
             # 批量编码（分批处理以显示进度）
-            batch_size = 10  # 降低批大小，减轻本地推理压力
+            batch_size = max(1, self._cfg.runtime.embedding_batch_size)
             all_embeddings = []
 
             for i in tqdm(range(0, len(node_texts), batch_size), desc="节点向量化进度"):
@@ -2181,6 +1670,8 @@ class Indexer:
                 batch_nodes = nodes[i:i+batch_size]
                 batch_node_types = node_types[i:i+batch_size]
                 batch_embeddings = self._embed.encode(batch_texts)
+                if len(batch_embeddings) != len(batch_nodes):
+                    raise ValueError("Embedding result count does not match source nodes")
 
                 if batch_embeddings:
                     all_embeddings.extend(batch_embeddings)
@@ -2202,6 +1693,7 @@ class Indexer:
             # 如果是embedding维度问题，提供详细错误
             if "dimension" in str(e).lower():
                 print("   提示: 检查embedding模型配置")
+            raise
 
     def _get_node_type_str(self, node) -> str:
         """获取节点类型字符串（用于TypedVectorStore）
@@ -2400,6 +1892,19 @@ class Indexer:
                                                 break
                         except Exception:
                             pass
+
+        elif isinstance(node, Claim):
+            # Occurrence IDs and indexing metadata are addresses, not semantics.
+            def reference_name(reference):
+                data = self._graph.get_node(reference) or {}
+                return data.get("canonical_name") or data.get("name") or data.get("title") or ""
+            source_name = reference_name(node.source_id)
+            target_name = reference_name(node.target_id)
+            if source_name:
+                parts.append(f"{source_name} says")
+            if target_name:
+                parts.append(f"about {target_name}:")
+            parts.append(node.content or "")
 
         elif isinstance(node, Person):
             # P0 FIX 1.3: Person节点 - 使用更丰富的文本表示

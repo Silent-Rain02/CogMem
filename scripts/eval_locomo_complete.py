@@ -504,16 +504,16 @@ def map_category_id_to_name(category_id: int) -> str:
     
     根据官方评估代码 (locomo/task_eval/evaluation.py):
     - category 1 = Multi-Hop (使用多答案F1)
-    - category 2 = Single-Hop (使用单答案F1)
-    - category 3 = Temporal (时间推理)
-    - category 4 = Open Domain (开放域)
+    - category 2 = Temporal
+    - category 3 = Open Domain
+    - category 4 = Single-Hop
     - category 5 = Adversarial (对抗性)
     """
     category_map = {
         1: "Multi-Hop",      # Multi-Hop（多跳问题）
-        2: "Single Hop",     # Single-Hop（单跳问题）
-        3: "Temporal",       # Temporal（时间推理问题）
-        4: "Open Domain",   # Open Domain（开放域问题）
+        2: "Temporal",       # Temporal（时间推理）
+        3: "Open Domain",    # Open Domain（开放域）
+        4: "Single Hop",     # Single-Hop（单跳问题）
         5: "Adversarial"     # Adversarial（对抗性问题）
     }
     return category_map.get(category_id, "Unknown")
@@ -669,7 +669,7 @@ def comprehensive_evaluation(
                 
                 # 选择提炼提示词
                 from cogmem.prompt import ANSWER_REFINEMENT_PROMPT, ANSWER_REFINEMENT_CATEGORY3_PROMPT
-                if category_id == 3:  # Temporal
+                if category_id == 3:  # Official category-3 reference handling
                     refine_prompt = ANSWER_REFINEMENT_CATEGORY3_PROMPT.format(question=question, evidence=integrated_evidence)
                 else:
                     refine_prompt = ANSWER_REFINEMENT_PROMPT.format(question=question, evidence=integrated_evidence)
@@ -693,7 +693,7 @@ def comprehensive_evaluation(
             
             # 计算指标（传递 gam_mode 标志）
             processed_gold_answer = gold_answer
-            if category_id == 3:  # Temporal
+            if category_id == 3:  # Official category-3 reference handling
                 processed_gold_answer = gold_answer.split(';')[0].strip()
             
             if category_id == 1:  # Multi-Hop

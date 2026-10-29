@@ -380,9 +380,9 @@ class Event(BaseNode):
     def effective_time(self) -> Optional[str]:
         """Best available time for this event (v3.3 Enhancement)
         
-        Priority: time_resolved > time_start > session_time
+        Priority: time_resolved > time_start; session_time is only a reference
         """
-        return self.time_resolved or self.time_start or self.session_time
+        return self.time_resolved or self.time_start
     
     def model_dump(self, **kwargs) -> Dict[str, Any]:
         """Override model_dump to include computed timestamp"""
@@ -393,159 +393,21 @@ class Event(BaseNode):
     @field_validator('time_start', 'time_end')
     @classmethod
     def validate_iso_datetime(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
-        """Validate ISO-8601 datetime format for temporal fields
-
-        Supports flexible time formats:
-        - Full datetime: YYYY-MM-DDTHH:MM:SS
-        - Date only: YYYY-MM-DD
-        - Partial dates with 'XX' placeholders
-        - Year-month only: YYYY-MM
-        - Year only: YYYY (normalized to YYYY-01-01)
-        - Special values: 'recently', 'lately' (treated as unknown)
-        """
-        if v is None:
-            return v
-
+        """Validate absolute time without expanding coarse precision."""
+        from ..utils.temporal import normalize_event_time
         from datetime import datetime
-        import re
-
-        v = str(v).strip()
-
-        # Pre-process ISO-8601 format
-        if 't' in v and ('z' in v or '+' in v or v.count(':') >= 2):
-            v = v.replace('t', 'T').replace('z', 'Z')
-
-        # Handle empty or "unknown"-like strings
-        if not v or v.lower() in ["unknown", "none", "null", "n/a", "na", "unspecified"]:
-            return "XXXX-XX-XX"
-
-        v_lower = v.lower()
-        if v_lower in ["recently", "recent", "lately", "sometime", "sometimes", "earlier", "before"]:
-            # Return None instead of "XXXX-XX-XX" - this allows time_start to be None
-            # The raw value should be preserved in time_start_raw by the caller
+        if v is None or str(v).strip().lower() in {"", "unknown", "none", "null", "unspecified"}:
             return None
-
-        # Handle "yesterday", "today", "tomorrow"
-        if v_lower in ["yesterday", "today", "tomorrow"]:
-            raise ValueError(f"Relative date '{v}' must be resolved to absolute date before validation. Use indexer._normalize_relative_time()")
-
-        # CRITICAL FIX: Try to parse natural language dates like "January 2023", "19 January, 2023"
-        # Use dateutil.parser if available, otherwise use enhanced regex
-        try:
-            from dateutil import parser as date_parser
+        normalized = normalize_event_time(str(v))
+        if normalized is not None:
+            return normalized
+        if "T" in str(v):
             try:
-                parsed_date = date_parser.parse(v, fuzzy=True, default=None)
-                if parsed_date:
-                    # Normalize to ISO format
-                    # For partial dates like "January 2023", use first day of month
-                    if len(v.split()) == 2 and any(month in v_lower for month in ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']):
-                        # Year-month only: return YYYY-MM format
-                        return parsed_date.strftime("%Y-%m")
-                    else:
-                        # Full date: return YYYY-MM-DD format
-                        return parsed_date.strftime("%Y-%m-%d")
-            except (ValueError, TypeError):
-                pass
-        except ImportError:
-            # Fallback: Enhanced regex for common patterns
-            # Pattern: "January 2023" or "19 January, 2023" or "January 19, 2023"
-            month_names = {
-                'january': '01', 'february': '02', 'march': '03', 'april': '04',
-                'may': '05', 'june': '06', 'july': '07', 'august': '08',
-                'september': '09', 'october': '10', 'november': '11', 'december': '12'
-            }
-            
-            import re
-            # Pattern: "Month Year" (e.g., "January 2023")
-            month_year_pattern = r'(\w+)\s+(\d{4})'
-            match = re.search(month_year_pattern, v_lower, re.IGNORECASE)
-            if match:
-                month_str, year_str = match.groups()
-                month_num = month_names.get(month_str.lower())
-                if month_num and 1900 <= int(year_str) <= 2100:
-                    # Return YYYY-MM format for partial dates
-                    return f"{year_str}-{month_num}"
-            
-            # Pattern: "DD Month, YYYY" or "Month DD, YYYY"
-            date_patterns = [
-                r'(\d{1,2})\s+(\w+),?\s+(\d{4})',  # "19 January, 2023"
-                r'(\w+)\s+(\d{1,2}),?\s+(\d{4})',   # "January 19, 2023"
-            ]
-            for pattern in date_patterns:
-                match = re.search(pattern, v_lower, re.IGNORECASE)
-                if match:
-                    groups = match.groups()
-                    if len(groups) == 3:
-                        # Try to identify which is day and which is month
-                        if groups[0].isdigit():
-                            day, month_str, year = groups[0], groups[1], groups[2]
-                        else:
-                            month_str, day, year = groups[0], groups[1], groups[2]
-                        
-                        month_num = month_names.get(month_str.lower())
-                        if month_num and 1900 <= int(year) <= 2100 and 1 <= int(day) <= 31:
-                            return f"{year}-{month_num}-{day:02d}"
-
-        # Handle partial dates with XX placeholders
-        if 'XX' in v.upper():
-            parts = v.split('-')
-
-            # XXXX-XX-XX (completely unknown)
-            if len(parts) == 3 and parts[0].upper() == 'XXXX' and parts[1].upper() == 'XX' and parts[2].upper() == 'XX':
-                return v.upper()
-
-            # YYYY-XX-XX (month and day unknown)
-            if len(parts) == 3 and parts[0].isdigit() and parts[1].upper() == 'XX' and parts[2].upper() == 'XX':
-                year = int(parts[0])
-                if 1900 <= year <= 2100:
-                    return v.upper()
-
-            # YYYY-MM-XX (day unknown)
-            elif len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2].upper() == 'XX':
-                year, month = int(parts[0]), int(parts[1])
-                if 1900 <= year <= 2100 and 1 <= month <= 12:
-                    return v.upper()
-
-            # YYYY-XX (month unknown) - normalize to YYYY-01-XX
-            elif len(parts) == 2 and parts[0].isdigit() and parts[1].upper() == 'XX':
-                    year = int(parts[0])
-                    if 1900 <= year <= 2100:
-                        return f"{year}-01-XX"
-
-        # Year only: YYYY → normalize to YYYY-01-01
-        if re.match(r'^\d{4}$', v):
-            year = int(v)
-            if 1900 <= year <= 2100:
-                return f"{year}-01-01"
-
-        # Year-month only: YYYY-MM → keep as is
-        if re.match(r'^\d{4}-\d{2}$', v):
-            try:
-                datetime.strptime(v, "%Y-%m")
-                return v
+                datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+                return str(v)
             except ValueError:
                 pass
-
-        # Full ISO format dates
-        if 'T' in v:
-            try:
-                datetime.fromisoformat(v.replace('Z', '+00:00'))
-                return v
-            except ValueError:
-                pass
-        else:
-            # Date only: YYYY-MM-DD
-            try:
-                datetime.strptime(v, "%Y-%m-%d")
-                return v
-            except ValueError:
-                pass
-
-        # If we got here, validation failed
-        raise ValueError(
-            f'Invalid ISO-8601 datetime format: {v}. '
-            f'Supported formats: YYYY-MM-DD, YYYY-MM-XX, YYYY-XX-XX, YYYY-XX, YYYY-MM, YYYY, or YYYY-MM-DDTHH:MM:SS'
-        )
+        raise ValueError("Event time must be a valid absolute date with its original precision")
 
     @field_validator('id')
     @classmethod
@@ -556,28 +418,20 @@ class Event(BaseNode):
         return v.strip()
 
     def model_post_init(self, __context: Any) -> None:
-        """Post-initialization validation (ensure at least one timestamp is provided)
-        
-        CRITICAL FIX: Allow Event without time_start/time_end if time_start_raw exists.
-        This supports fuzzy time expressions like "recently" that cannot be normalized
-        to ISO format but should still be preserved.
-        """
+        """An event may have an unknown occurrence time."""
         super().model_post_init(__context)
-        # Allow Event without time_start/time_end if time_start_raw exists (fuzzy time)
-        if not self.time_start and not self.time_end and not self.time_start_raw:
-            raise ValueError(
-                'Event must have at least one timestamp (time_start, time_end, or time_start_raw)'
-            )
 
     def overlaps_with(self, start: str, end: str) -> bool:
-        """Check if this event overlaps with a time range"""
-        event_start = self.time_start
-        event_end = self.time_end or self.time_start
-
-        if not event_start:
+        """Test calendar-date overlap, respecting coarse date precision."""
+        from ..utils.temporal import date_bounds
+        event_start = date_bounds(self.effective_time)
+        event_end = date_bounds(self.time_end or self.effective_time)
+        query_start, query_end = date_bounds(start), date_bounds(end)
+        if not all((event_start, event_end, query_start, query_end)):
             return False
-
-        return event_start <= end and event_end >= start
+        if query_start[0] > query_end[1] or event_start[0] > event_end[1]:
+            return False
+        return event_start[0] <= query_end[1] and event_end[1] >= query_start[0]
 
     model_config = {
         "validate_assignment": True,
@@ -761,44 +615,8 @@ class Fact(BaseNode):
     @field_validator('valid_from', 'valid_to')
     @classmethod
     def validate_temporal_range(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
-        """Validate ISO-8601 datetime format for temporal fields
-        
-        Supports:
-        - Full datetime: YYYY-MM-DDTHH:MM:SS
-        - Date only: YYYY-MM-DD
-        - Year-month: YYYY-MM (normalized to YYYY-MM-01)
-        - None: allowed for optional fields
-        """
-        if v is None:
-            return v
-
-        from datetime import datetime
-        import re
-        
-        v = str(v).strip()
-        
-        # Handle "YYYY-MM" format (year-month only)
-        year_month_match = re.match(r'^(\d{4})-(\d{2})$', v)
-        if year_month_match:
-            year, month = year_month_match.groups()
-            # Validate month and return normalized format
-            if 1 <= int(month) <= 12:
-                return f"{year}-{month}-01"  # Normalize to first day of month
-        
-        # Handle full datetime format
-        if 'T' in v:
-            try:
-                datetime.fromisoformat(v.replace('Z', '+00:00'))
-                return v
-            except ValueError:
-                raise ValueError(f'Invalid ISO-8601 format: {v}')
-        
-        # Handle date-only format (YYYY-MM-DD)
-        try:
-            datetime.strptime(v, "%Y-%m-%d")
-            return v
-        except ValueError:
-            raise ValueError(f'Invalid ISO-8601 format: {v}')
+        """Retain the evidence's date precision."""
+        return Event.validate_iso_datetime(v, info)
 
     @model_validator(mode='after')
     def validate_object_or_purpose(self) -> 'Fact':

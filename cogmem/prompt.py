@@ -4,8 +4,8 @@ Extract the following:
 1. **Events**: Specific occurrences or happenings mentioned in the conversation.
    - Include: who participated, what happened, when (if mentioned)
    - Format: {{"type": "event", "title": "...", "participants": [...], "time": "...", "concepts": [...]}}
-   - `title` should be a short event description, e.g. "Caroline attended a LGBTQ support group"
-   - `concepts` should contain salient activity/topic phrases, e.g. ["LGBTQ support group", "community support"]
+   - `title` should be a short description of the specific event.
+   - `concepts` should contain salient activity/topic phrases grounded in the supplied conversation.
 
 2. **Facts**: Objective facts about people, their attributes, preferences, or states.
    - Include: subject, predicate, object
@@ -135,56 +135,31 @@ Reply with valid JSON only in this schema:
 }}
 """
 
-MEMORY_CONSOLIDATION_SYSTEM = """You are a memory consolidation expert. Your task is to analyze extracted facts and events, identify duplicates or related information, and merge them into clean, canonical facts.
-
-Consolidation Rules:
-1. **Deduplication**: Identify facts that express the same information and merge them.
-2. **Temporal Chains**: If the same fact changes over time (e.g., "lives in X" -> "moved to Y"), keep the timeline and mark the most recent as current.
-3. **Confidence Scoring**: Assign confidence scores based on:
-   - Direct statements (high confidence)
-   - Inferred information (medium confidence)
-   - Unclear or ambiguous (low confidence)
-4. **Source Tracking**: Preserve source references for traceability.
-
-Output Format:
-For each consolidated fact, output:
-{{
-  "subject": "entity name",
-  "predicate": "relationship/attribute",
-  "object": "value",
-  "confidence": 0.0-1.0,
-  "sources": ["source_id_1", "source_id_2"],
-  "temporal_info": "when this fact was true (if known)"
-}}
+MEMORY_CONSOLIDATION_SYSTEM = """You synthesize one source-grounded fact from related events about a person and a concept.
+Use only the supplied events. Preserve attribution, uncertainty and temporal scope.
+Do not turn a single event into an unsupported habit or reconcile incompatible claims.
+Return one JSON object, not an array or a Markdown block, using this schema:
+{
+  "content": "a concise fact supported by the events",
+  "predicate": "relationship or attribute",
+  "object_id": "the supplied concept ID",
+  "confidence": 0.0,
+  "valid_from": null,
+  "valid_to": null
+}
+Use ISO dates only when supported; otherwise use null.
 """
 
-MEMORY_CONSOLIDATION_USER = """Consolidate the following extracted information:
+MEMORY_CONSOLIDATION_USER = """Person: {person_name} (ID: {person_id})
+Concept: {concept_name} (ID: {concept_id})
 
-Existing Memory:
-{existing_memory}
+Source events:
+{events_json}
 
-New Extractions:
-{new_extractions}
-
-Provide consolidated facts as a JSON array.
+Synthesize one supported fact as a JSON object in the required schema.
 """
 
-ANSWER_REFINEMENT_PROMPT = """\
-Based on the retrieved evidence, answer the question concisely.
-
-Question: {question}
-
-Evidence:
-{evidence}
-
-Guidelines:
-- Answer directly and concisely.
-- If the evidence is insufficient, say "I don't have enough information".
-- Do not make up information not present in the evidence.
-- Use exact quotes from evidence when possible.
-
-Answer:
-"""
+ANSWER_REFINEMENT_PROMPT = 'Based on the retrieved original evidence, generate a concise final answer.\n\nQuestion: {question}\n\nEvidence:\n{evidence}\n\nRefinement rules:\n- Extract the requested content or value, not the attribute name or schema label.\n- Render dates naturally while preserving source precision. Prefer a source-relative phrase when appropriate, retaining its anchor if needed.\n- Include all supported items requested by the question. Do not omit an item merely to shorten the answer.\n- Normally answer in fewer than 15 words, except a complex how/why explanation.\n- If the original evidence is insufficient, say "I don\'t have enough information".\n\nAnswer:\n'
 
 ANSWER_REFINEMENT_CATEGORY3_PROMPT = """\
 Based on the structured evidence below, answer the question as a concise phrase when possible.

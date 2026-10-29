@@ -67,6 +67,24 @@ class ChunkStore:
             results.append((self._chunks[idx], float(score)))
         return results
 
+    def search_in_scope(self, query_vec: List[float], allowed_texts: set[str], top_k: int = 10) -> List[Tuple[Chunk, float]]:
+        """Rank the permitted sources themselves, before applying the read limit."""
+        if top_k <= 0 or not allowed_texts:
+            return []
+        positions = [i for i, chunk in enumerate(self._chunks) if chunk.text in allowed_texts]
+        if {self._chunks[i].text for i in positions} != allowed_texts:
+            raise ValueError('Some permitted sources are missing from the chunk index')
+        query = np.asarray([query_vec], dtype=np.float32)
+        if query.shape != (1, self._dim) or not np.isfinite(query).all():
+            raise ValueError('Invalid query vector')
+        if self._metric == 'cosine':
+            query = self._normalize(query)
+        vectors = np.asarray([self._index.reconstruct(i) for i in positions])
+        scores = vectors @ query[0] if self._metric == 'cosine' else ((vectors-query[0])**2).sum(axis=1)
+        ranked = sorted(range(len(positions)), key=lambda i: (
+            -float(scores[i]) if self._metric == 'cosine' else float(scores[i]), positions[i]))
+        return [(self._chunks[positions[i]], float(scores[i])) for i in ranked[:top_k]]
+
     def save(self, index_path: str, chunks_path: str) -> None:
         os.makedirs(os.path.dirname(index_path), exist_ok=True)
         faiss.write_index(self._index, index_path)

@@ -42,17 +42,18 @@ class BM25Retriever:
         tokens = re.findall(r'\b\w+\b', text.lower())
         return tokens
     
-    def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
+    def search(self, query: str, top_k: int = 10, allowed_indices: Optional[set[int]] = None) -> List[Tuple[int, float]]:
         """搜索最相关的文档
         
         Args:
             query: 查询字符串
             top_k: 返回的文档数量
+            allowed_indices: Optional eligible corpus positions; applied before top-k.
             
         Returns:
             List of (doc_index, score) tuples, sorted by score descending
         """
-        if not query:
+        if not query or top_k <= 0:
             return []
         
         tokenized_query = self.tokenize_fn(query)
@@ -62,7 +63,8 @@ class BM25Retriever:
         scores = self.bm25.get_scores(tokenized_query)
         
         # 获取 top-k
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        eligible = range(len(scores)) if allowed_indices is None else sorted(allowed_indices)
+        top_indices = sorted(eligible, key=lambda i: scores[i], reverse=True)[:top_k]
         
         return [(idx, scores[idx]) for idx in top_indices if scores[idx] > 0]
     

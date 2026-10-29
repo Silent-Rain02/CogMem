@@ -40,9 +40,9 @@ from .concept_merger import ConceptMerger
 from .fact_deduplicator import FactDeduplicator
 from .claim_reconciler import ClaimReconciler
 
-def _make_fact_id(person_id: str, concept_id: str, predicate: str) -> str:
+def _make_fact_id(person_id: str, concept_id: str, predicate: str, source_event_ids=()) -> str:
     """Generate a unique Fact ID based on person, concept, and predicate"""
-    content = f"{person_id}_{concept_id}_{predicate}"
+    content = json.dumps([person_id, concept_id, predicate, sorted(set(source_event_ids))], ensure_ascii=False)
     return f"fact_{hashlib.sha1(content.encode('utf-8')).hexdigest()}"
 
 class MemoryConsolidator:
@@ -396,7 +396,7 @@ class MemoryConsolidator:
                 for concept_id, event_list in concept_clusters.items():
                     if len(event_list) < min_events:
                         continue  # Skip clusters with too few events
-                    if self._has_stable_fact_for(person_id, concept_id):
+                    if self._has_synthesis_for(person_id, concept_id, event_list):
                         continue  # Reduce duplicate synthesis
 
                     stats["events_clustered"] += len(event_list)
@@ -417,6 +417,11 @@ class MemoryConsolidator:
             # Determine max_workers from config or use default
             max_llm_workers = getattr(self.config.extraction, 'max_llm_workers', 10)
             fact_results = self._synthesize_facts_batch(synthesis_tasks, max_workers=max_llm_workers)
+            stats["synthesis_attempted"] = len(synthesis_tasks)
+            stats["synthesis_succeeded"] = len(fact_results)
+            stats["synthesis_failed"] = len(synthesis_tasks) - len(fact_results)
+            if stats["synthesis_failed"]:
+                stats["errors"].append(f"{stats['synthesis_failed']} fact synthesis tasks failed")
             
             # Create fact nodes from results
             for (person_id, concept_id), fact_data in fact_results:
@@ -624,16 +629,19 @@ class MemoryConsolidator:
 
         return dict(clusters)
 
-    def _has_stable_fact_for(self, person_id: str, concept_id: str) -> bool:
-        """Return True if a non-archived (stable) Fact already exists for this (person, concept)."""
-        for node_id, node_data in self.graph._g.nodes(data=True):
-            if not node_data or node_data.get('node_type') != NodeTypeEnum.FACT.value:
+    def _has_synthesis_for(self, person_id, concept_id, events):
+        """Skip only a derived fact built from this exact source set."""
+        expected = {event['id'] for event in events if event.get('id')}
+        if not expected:
+            return False
+        for node_id, data in self.graph._g.nodes(data=True):
+            if (data.get('node_type') != 'fact' or data.get('subject_id') != person_id
+                    or data.get('object_id') != concept_id
+                    or (data.get('metadata') or {}).get('source') != 'memory_consolidation'):
                 continue
-            if node_data.get('is_archived'):
-                continue
-            if node_data.get('subject_id') != person_id:
-                continue
-            if node_data.get('object_id') == concept_id or node_data.get('purpose_id') == concept_id:
+            actual = {target for _, target, edge in self.graph._g.out_edges(node_id, data=True)
+                      if edge.get('rel_type') == 'SUPPORTED_BY'}
+            if actual == expected:
                 return True
         return False
 
@@ -692,7 +700,7 @@ class MemoryConsolidator:
                 if json_match:
                     fact_data = safe_json_loads(json_match.group())
 
-            if not fact_data:
+            if not isinstance(fact_data, dict) or not fact_data:
                 print(f"[Consolidator] Failed to parse LLM response: {response[:200]}")
                 return None
 
@@ -753,62 +761,23 @@ class MemoryConsolidator:
                         results.append((futures[future], fact_data))
                 except Exception as e:
                     person_id, concept_id = futures[future]
-                    if self.config.runtime.max_concurrency == 1:
-                        print(f"[Consolidator] Error synthesizing fact for {person_id} + {concept_id}: {e}")
+                    print(f"[Consolidator] Error synthesizing fact for {person_id} + {concept_id}: {e}")
         
         print(f"[Consolidator] Successfully synthesized {len(results)}/{len(tasks)} facts")
         return results
 
     def _normalize_fact_date(self, date_str: Optional[str]) -> Optional[str]:
-        """Normalize date string for Fact valid_from/valid_to fields
-        
-        Handles:
-        - "recently", "lately" -> None (fuzzy time, no specific date)
-        - "YYYY-MM" -> "YYYY-MM-01" (year-month only, add day)
-        - "YYYY-MM-DD" -> as-is (valid ISO format)
-        - "YYYY-MM-DDTHH:MM:SS" -> as-is (valid ISO format)
-        - None -> None
-        - Invalid formats -> None (will be skipped)
-        """
-        if not date_str:
-            return None
-        
-        date_str = str(date_str).strip()
-        
-        # Handle fuzzy time expressions
-        fuzzy_time = ["recently", "lately", "sometime", "sometimes", "earlier", "before", "recent"]
-        if date_str.lower() in fuzzy_time:
-            return None  # Fuzzy time, no specific date
-        
-        # Handle "YYYY-MM" format (year-month only)
-        import re
-        year_month_match = re.match(r'^(\d{4})-(\d{2})$', date_str)
-        if year_month_match:
-            year, month = year_month_match.groups()
-            # Validate month
-            if 1 <= int(month) <= 12:
-                return f"{year}-{month}-01"  # Use first day of month
-        
-        # Handle "YYYY-MM-DD" format
-        date_match = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', date_str)
-        if date_match:
-            year, month, day = date_match.groups()
-            # Validate date
-            try:
-                datetime(int(year), int(month), int(day))
-                return date_str
-            except ValueError:
-                return None
-        
-        # Handle "YYYY-MM-DDTHH:MM:SS" format
-        if 'T' in date_str:
+        """Preserve absolute precision without fabricating validity boundaries."""
+        from ..utils.temporal import normalize_event_time
+        normalized = normalize_event_time(date_str)
+        if normalized is not None:
+            return normalized
+        if isinstance(date_str, str) and 'T' in date_str:
             try:
                 datetime.fromisoformat(date_str.replace('Z', '+00:00'))
                 return date_str
             except ValueError:
-                return None
-        
-        # Invalid format, return None
+                pass
         return None
 
     def _create_fact_node(
@@ -832,7 +801,8 @@ class MemoryConsolidator:
         """
         
         # Generate Fact ID
-        fact_id = _make_fact_id(person_id, fact_data.get('object_id', concept_id), fact_data['predicate'])
+        fact_id = _make_fact_id(person_id, fact_data.get('object_id', concept_id), fact_data['predicate'],
+                                [event['id'] for event in supporting_events if event.get('id')])
 
         # Check if Fact already exists
         if fact_id in self.graph._g:
@@ -908,7 +878,7 @@ class MemoryConsolidator:
         
         # Sort by score (descending) and take top max_supported_by
         scored_events.sort(key=lambda x: x[0], reverse=True)
-        top_events = scored_events[:max_supported_by]
+        top_events = scored_events  # Preserve every source link; read-time retrieval owns the budget.
         
         for _, event in top_events:
             event_id = event.get('id', '')
@@ -993,11 +963,11 @@ class MemoryConsolidator:
         # This fixes the 91.8% bad cases issue where Facts have no evidence
         if self.evidence_store:
             try:
-                for event in supporting_events[:max_supported_by]:
+                for event in supporting_events:
                     event_id = event.get('id', '')
                     if event_id:
                         # Get chunks from event and register for fact
-                        event_chunks = self.evidence_store.get_chunks(event_id, limit=3)
+                        event_chunks = self.evidence_store.get_chunks(event_id, limit=None)
                         for chunk in event_chunks:
                             self.evidence_store.add_chunk_for_entity(fact_id, chunk)
             except Exception as e:

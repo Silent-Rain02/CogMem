@@ -45,6 +45,11 @@ class ModelConfig:
     modelscope_base_url: str = "http://localhost:8000/v1"
     modelscope_embedding_base_url: Optional[str] = None  # 如果为 None 则使用 base_url
 
+    # Explicit API options; unset dimensions preserve providers without that capability.
+    embedding_dimensions: Optional[int] = None
+    chat_max_tokens: Optional[int] = None
+    chat_extra_body: Dict[str, Any] = field(default_factory=dict)
+
 @dataclass
 class FAISSConfig:
     metric: str = "cosine"  # cosine | l2
@@ -54,6 +59,7 @@ class FAISSConfig:
 @dataclass
 class RuntimeConfig:
     batch_size: int = 2
+    embedding_batch_size: int = 10
     max_concurrency: int = 2
     request_timeout_s: int = 300
 
@@ -154,7 +160,8 @@ def classify_question_type(query: str) -> QuestionType:
 @dataclass
 class AgentConfig:
     """Agent 配置 (v3.3 Enhanced with Dynamic Configuration)"""
-    max_iterations: int = 4  # SearchAgent 默认迭代次数；题型配置会进一步覆盖
+    max_iterations: int = 4  # Maximum planning rounds; excludes automatic source retrieval.
+    max_tool_calls: Optional[int] = None  # None: 3 initial operators + 2 per effective planning round.
     
     # ===== 搜索工具参数配置 =====
     # 基于真实索引数据分析（analyze_node_lengths.py）和模型上下文窗口设计

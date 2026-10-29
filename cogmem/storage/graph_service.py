@@ -56,6 +56,7 @@ class GraphService:
         self._bm25_retriever: Optional[BM25Retriever] = None
         self._bm25_node_index: Dict[int, str] = {}  # corpus_index -> node_id
         self._bm25_initialized = False
+        self._bm25_graph_state = None
 
     def find_anchors(self, query: str, types: Optional[List[str]] = None, top_k: int = 5,
                      exact_match_boost: float = 1.0) -> List[AnchorResult]:
@@ -204,35 +205,21 @@ class GraphService:
                 aliases = node_data.get('aliases', [])
                 if aliases and isinstance(aliases, list):
                     for alias in aliases:
-                        if isinstance(alias, str):
-                            alias_lower = alias.lower()
-                            if alias_lower == query_lower:
-                                results_map[node_id] = AnchorResult(
-                                    node_id=node_id,
-                                    node_type=node_type,
-                                    name=canonical_name or node_id,
-                                    score=1.0,
-                                    metadata=node_data
-                                )
-                                break
-                            elif query_lower in alias_lower or alias_lower in query_lower:
-                                results_map[node_id] = AnchorResult(
-                                    node_id=node_id,
-                                    node_type=node_type,
-                                    name=canonical_name or node_id,
-                                    score=0.85, # Alias match lower priority than canonical
-                                    metadata=node_data
-                                )
-                                break
-                            elif is_long_query and alias_lower in query_lower:
-                                results_map[node_id] = AnchorResult(
-                                    node_id=node_id,
-                                    node_type=node_type,
-                                    name=canonical_name or node_id,
-                                    score=0.9,
-                                    metadata=node_data
-                                )
-                                break
+                        if not isinstance(alias, str) or not alias.strip():
+                            continue
+                        alias_lower = alias.lower().strip()
+                        if alias_lower == query_lower:
+                            alias_score = 1.0
+                        elif query_lower in alias_lower or alias_lower in query_lower:
+                            alias_score = 0.85
+                        else:
+                            continue
+                        previous = results_map.get(node_id)
+                        if previous is None or alias_score > previous.score:
+                            results_map[node_id] = AnchorResult(
+                                node_id=node_id, node_type=node_type,
+                                name=canonical_name or node_id,
+                                score=alias_score, metadata=node_data)
             
             # Check Concept nodes
             elif node_type == 'concept':
@@ -274,14 +261,20 @@ class GraphService:
         # 这可以捕获拼写变体和近义词，例如 "salsa" 能够匹配 "salsa_dancing"
         if len(results_map) < top_k:
             # 延迟初始化 BM25 索引（按需构建）
-            if not self._bm25_initialized:
+            if not self._bm25_initialized or self._bm25_graph_state != self._lexical_graph_state():
                 self._build_bm25_index()
 
             # 使用 BM25 进行模糊搜索
             if self._bm25_retriever and self._bm25_retriever.corpus:
                 try:
                     # 搜索更多候选结果（top_k * 2）以确保有足够的结果可以过滤
-                    bm25_results = self._bm25_retriever.search(query, top_k=top_k * 2)
+                    eligible = set()
+                    for corpus_idx, node_id in self._bm25_node_index.items():
+                        node = self.graph_store.get_node(node_id)
+                        if node and not node.get('is_archived') and (not types or node.get('node_type') in types):
+                            eligible.add(corpus_idx)
+                    bm25_results = self._bm25_retriever.search(
+                        query, top_k=top_k * 2, allowed_indices=eligible)
 
                     # 处理 BM25 搜索结果
                     for corpus_idx, score in bm25_results:
@@ -352,13 +345,6 @@ class GraphService:
                     vector_results = self.vector_store.search(query_embedding, top_k=vector_top_k)
 
                 for node_id, score in vector_results:
-                    if len(results_map) >= top_k + 5: # Allow slight overflow for better final sorting
-                        break
-
-                    # Skip if already found
-                    if node_id in results_map:
-                        continue
-
                     node_data = self.graph_store.get_node(node_id)
                     if not node_data:
                         continue
@@ -377,6 +363,12 @@ class GraphService:
                     else:
                         if score_float < 0.5:
                             continue
+
+                    # Merge all returned candidates before final top-k. A weak
+                    # earlier channel must not hide the same node's better score.
+                    if node_id in results_map:
+                        results_map[node_id].score = max(results_map[node_id].score, score_float)
+                        continue
 
                     # Get display name
                     if node_type == 'person':
@@ -485,11 +477,19 @@ class GraphService:
 
         return final_results
 
+    def _lexical_graph_state(self):
+        """Track public graph upserts and reloads without persistent schema changes."""
+        graph = self.graph_store._g
+        return (id(graph), len(graph), len(getattr(self.graph_store, '_changelog', ())))
+
     def _build_bm25_index(self):
         """构建 BM25 索引（延迟加载，按需构建）
         
         构建包含所有节点的完整索引，类型过滤在搜索时进行。
         """
+        self._bm25_graph_state = self._lexical_graph_state()
+        self._bm25_retriever = None
+        self._bm25_node_index = {}
         if not BM25_AVAILABLE:
             self._bm25_initialized = True
             return
@@ -519,11 +519,10 @@ class GraphService:
                         else:
                             text_parts.append(str(node_data['aliases']))
                 
-                # Concept: ID (normalized) + description
+                # Storage addresses are opaque; index the semantic fields.
                 elif node_type == 'concept':
-                    # 从 ID 提取概念名称
-                    concept_name = node_id.replace('c_', '').replace('_', ' ')
-                    text_parts.append(concept_name)
+                    if node_data.get('name'):
+                        text_parts.append(str(node_data['name']))
                     if 'description' in node_data:
                         text_parts.append(str(node_data['description']))
                 
@@ -534,13 +533,12 @@ class GraphService:
                     if 'description' in node_data:
                         text_parts.append(str(node_data['description']))
                 
-                # Fact: 使用 ID 和描述
+                # Fact content contains the proposition; its ID is provenance.
                 elif node_type == 'fact':
+                    if node_data.get('content'):
+                        text_parts.append(str(node_data['content']))
                     if 'description' in node_data:
                         text_parts.append(str(node_data['description']))
-                    # 从 ID 提取信息
-                    fact_id = node_id.replace('f_', '').replace('_', ' ')
-                    text_parts.append(fact_id)
                 
                 # Claim: content
                 elif node_type == 'claim':
@@ -794,7 +792,7 @@ class GraphService:
         common_nodes = []
         node_type_counts = {}
 
-        for neighbor_id in common_neighbors:
+        for neighbor_id in sorted(common_neighbors):
             # Get node data (try from any entity's neighbor map)
             neighbor_data = None
             for entity_id in entity_ids:

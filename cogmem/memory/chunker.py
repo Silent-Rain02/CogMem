@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import re
 from typing import List
 
 from ..config import CogMemConfig
@@ -56,33 +57,19 @@ class DialogChunker(BaseChunker):
         if len(text) <= max_length:
             return [text]
         
-        # Try to split by turn markers (common patterns)
-        # Patterns: "User:", "Assistant:", "Human:", "AI:", "Turn", etc.
-        turn_markers = ["\nUser:", "\nAssistant:", "\nHuman:", "\nAI:", "\nTurn "]
-        
+        # Dialogue delimiters are structural line prefixes, not words quoted in
+        # an utterance. Preserve original offsets, whitespace and line endings.
+        turn_start = re.compile(r"^[ \t]*(?:(?:User|Assistant|Human|AI):|Turn[ \t]+\d+[ \t]*:)")
         chunks = []
-        current_chunk = ""
-        lines = text.split("\n")
-        
-        for line in lines:
-            # Check if this line starts a new turn
-            is_new_turn = any(marker.strip() in line for marker in turn_markers)
-            
-            if is_new_turn and current_chunk and len(current_chunk) >= max_length:
-                chunks.append(current_chunk.strip())
-                current_chunk = line
-            else:
-                current_chunk += "\n" + line if current_chunk else line
-        
-        # Don't forget the last chunk
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        # If no good split points found, fall back to general chunking
-        if not chunks:
-            return GeneralChunker(self._cfg).chunk(doc)
-        
-        return chunks
+        start = offset = 0
+        for line in text.splitlines(keepends=True):
+            if turn_start.match(line) and offset - start >= max_length and offset > start:
+                chunks.append(text[start:offset])
+                start = offset
+            offset += len(line)
+        if start < len(text):
+            chunks.append(text[start:])
+        return chunks or [text]
 
 
 class ChunkerFactory:

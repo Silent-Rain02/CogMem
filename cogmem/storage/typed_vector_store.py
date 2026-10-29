@@ -92,7 +92,7 @@ class TypedVectorStore:
         
         # 添加到类型索引
         self._stores[node_type].add([node_id], [vector])
-        self._type_counts[node_type] += 1
+        self._type_counts[node_type] = self._stores[node_type].size()
         
         # 条件添加到全局索引
         if self._enable_global_index and self._global_store:
@@ -137,7 +137,7 @@ class TypedVectorStore:
         for node_type, (ids, vecs) in type_groups.items():
             if ids:
                 self._stores[node_type].add(ids, vecs)
-                self._type_counts[node_type] += len(ids)
+                self._type_counts[node_type] = self._stores[node_type].size()
         
         # 条件批量添加到全局索引
         if self._enable_global_index and self._global_store:
@@ -229,7 +229,7 @@ class TypedVectorStore:
             索引中的向量数量
         """
         if node_type is None:
-            return self._global_store.size()
+            return self._global_store.size() if self._global_store else sum(store.size() for store in self._stores.values())
         
         store = self._stores.get(node_type)
         if store is None:
@@ -242,7 +242,7 @@ class TypedVectorStore:
         Returns:
             Dict mapping node_type to count
         """
-        return dict(self._type_counts)
+        return {kind: store.size() for kind, store in self._stores.items()}
     
     def save(self, base_dir: str) -> None:
         """保存所有索引到磁盘
@@ -260,10 +260,10 @@ class TypedVectorStore:
         
         # 保存各类型索引
         for node_type, store in self._stores.items():
-            if store.size() > 0:
-                type_index_path = os.path.join(base_dir, f"{node_type.lower()}_index.faiss")
-                type_id_path = os.path.join(base_dir, f"{node_type.lower()}_ids.npy")
-                store.save(type_index_path, type_id_path)
+            # Persist empty indexes too, so deleted entries cannot reappear.
+            type_index_path = os.path.join(base_dir, f"{node_type.lower()}_index.faiss")
+            type_id_path = os.path.join(base_dir, f"{node_type.lower()}_ids.npy")
+            store.save(type_index_path, type_id_path)
         
         # 保存统计信息
         import json
@@ -319,55 +319,18 @@ class TypedVectorStore:
         self._type_counts.clear()
     
     def remove_typed(self, node_id: str, node_type: str) -> None:
-        """从向量索引中删除节点
-        
-        注意：FAISS 不支持直接删除单个向量，此方法通过重建索引实现删除。
-        对于频繁删除的场景，建议批量操作。
-        
-        Args:
-            node_id: 节点ID
-            node_type: 节点类型
-        """
+        """Remove the derived projection and keep counts equal to physical storage."""
         if node_type not in self._stores:
             return
-        
-        store = self._stores[node_type]
-        
-        # FAISS 不支持直接删除，需要重建索引
-        # 获取当前所有向量和ID
-        current_size = store.size()
-        if current_size == 0:
-            return
-        
-        # 由于 VectorStore 没有提供获取所有向量的方法，
-        # 我们采用标记删除的方式：在合并时，不删除向量索引，
-        # 而是在检索时过滤掉已删除的节点
-        # 
-        # 这里提供一个简单的实现：如果节点类型索引很小，重建它
-        # 否则，标记为已删除（需要在检索时过滤）
-        
-        # 简化实现：减少计数，但不实际删除向量（因为需要重建索引）
-        # 在实际使用中，合并操作会更新向量索引，所以这里只更新计数
-        if self._type_counts[node_type] > 0:
-            self._type_counts[node_type] -= 1
-        
-        # 如果启用了全局索引，也需要处理
-        # 但全局索引的删除更复杂，这里暂时跳过
-        # 在实际使用中，合并时会更新向量索引
-    
+        self._stores[node_type].remove(node_id)
+        self._type_counts[node_type] = self._stores[node_type].size()
+        if self._global_store:
+            self._global_store.remove(node_id)
+
     def get_vector(self, node_id: str) -> Optional[List[float]]:
-        """获取节点的向量（如果存在）
-        
-        注意：此方法需要遍历所有类型索引，效率较低。
-        主要用于调试和验证。
-        
-        Args:
-            node_id: 节点ID
-            
-        Returns:
-            向量（如果找到），否则 None
-        """
-        # 由于 VectorStore 没有提供按ID获取向量的方法，
-        # 这里返回 None，表示不支持
-        # 在实际使用中，向量应该从 embedding_encoder 重新生成
+        """Read the actual stored projection without calling an embedding model."""
+        for store in self._stores.values():
+            vector = store.get_vector(node_id)
+            if vector is not None:
+                return vector
         return None

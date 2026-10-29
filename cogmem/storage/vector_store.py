@@ -22,11 +22,37 @@ class VectorStore:
         return vectors / norms
 
     def add(self, ids: List[str], vectors: List[List[float]]) -> None:
+        if not ids and not vectors:
+            return
         arr = np.asarray(vectors, dtype=np.float32)
+        if len(ids) != len(vectors) or arr.shape != (len(ids), self._dim):
+            raise ValueError("Each ID requires one vector of the configured dimension")
+        if not np.isfinite(arr).all():
+            raise ValueError("Vectors must be finite")
         if self._metric == "cosine":
             arr = self._normalize(arr)
-        self._index.add(arr)
-        self._ids.extend(ids)
+        # An ID names one current derived projection, not multiple ANN entries.
+        if len(set(self._ids + ids)) != len(self._ids) + len(ids):
+            current = self._index.reconstruct_n(0, len(self._ids))
+            latest = dict(zip(self._ids, current))
+            latest.update(zip(ids, arr))
+            self._ids = list(latest)
+            self._index.reset()
+            self._index.add(np.asarray(list(latest.values()), dtype=np.float32))
+        else:
+            self._index.add(arr)
+            self._ids.extend(ids)
+
+    def get_vector(self, node_id: str):
+        if node_id not in self._ids:
+            return None
+        return self._index.reconstruct(self._ids.index(node_id)).tolist()
+
+    def remove(self, node_id: str) -> None:
+        positions = [i for i, value in enumerate(self._ids) if value == node_id]
+        if positions:
+            self._index.remove_ids(np.asarray(positions, dtype=np.int64))
+            self._ids = [value for value in self._ids if value != node_id]
 
     def search(self, query_vec: List[float], top_k: int = 10) -> List[Tuple[str, float]]:
         """Search for similar vectors
