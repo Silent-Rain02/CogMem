@@ -86,8 +86,6 @@ class ExtractionConfig:
     # v3.3: 时间解析增强
     resolve_relative_time: bool = True  # 是否将相对时间（yesterday）解析为绝对时间
     create_temporal_edges: bool = True  # 是否创建时间边（HAPPENED_BEFORE, HAPPENED_DURING）
-    # v3.3: Concept层级
-    build_concept_hierarchy: bool = True  # 是否构建Concept层级关系
 
 # ============================================================================
 # Question Type Classification (v3.3 New)
