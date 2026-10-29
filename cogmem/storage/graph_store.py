@@ -965,28 +965,21 @@ class GraphStore:
     # --- SUPERSEDES chain traversal ---
     
     def get_supersedes_chain(self, fact_id: str) -> List[str]:
-        """Get chain of facts that supersede this fact (follow SUPERSEDES edges backwards)"""
-        chain = []
-        visited = set()
-        current = fact_id
-        
-        while current and current not in visited:
+        """This fact and all explicit superseding predecessors, without dropping forks."""
+        if fact_id not in self._g:
+            return []
+        from collections import deque
+        pending, visited, chain = deque([fact_id]), set(), []
+        while pending:
+            current = pending.popleft()
+            if current in visited:
+                continue
             visited.add(current)
             chain.append(current)
-            
-            # Find facts that supersede current
-            next_facts = []
-            for _, target, _, data in self._g.in_edges(current, keys=True, data=True):
-                if data.get("rel_type") == "SUPERSEDES":
-                    next_facts.append(target)
-            
-            if next_facts:
-                current = next_facts[0]  # Take first superseding fact
-            else:
-                break
-        
+            pending.extend(sorted({source for source, _, data in self._g.in_edges(current, data=True)
+                if data.get('rel_type') == 'SUPERSEDES' and source not in visited}))
         return chain
-    
+
     def get_superseded_by(self, fact_id: str) -> List[str]:
         """Get facts that are superseded by this fact (follow SUPERSEDES edges forwards)"""
         superseded = []
@@ -996,27 +989,29 @@ class GraphStore:
         return superseded
     
     def get_latest_fact(self, subject: str, predicate: str) -> Optional[Fact]:
-        """Get the latest (non-superseded) fact for subject-predicate pair"""
-        # Get all facts for this subject-predicate
-        facts = self.get_facts_by_validity(subject=subject, predicate=predicate)
-        
-        if not facts:
+        """Return the unique active graph head; unresolved forks have no latest fact.
+
+        This is version topology, not current-time validity or a recency guess.
+        SUPERSEDES points from the replacement to the replaced node.
+        """
+        candidates = {node_id: data for node_id, data in self._g.nodes(data=True)
+            if data.get('node_type') == NodeTypeEnum.FACT.value
+            and data.get('subject_id') == subject and data.get('predicate') == predicate}
+        versions = nx.DiGraph()
+        versions.add_nodes_from(candidates)
+        for node_id in candidates:
+            for source, _, edge in self._g.in_edges(node_id, data=True):
+                if edge.get('rel_type') != 'SUPERSEDES':
+                    continue
+                if source not in candidates:
+                    return None  # Cross-proposition edges cannot certify a version head.
+                versions.add_edge(source, node_id)
+        if not nx.is_directed_acyclic_graph(versions):
             return None
-        
-        # Find facts that are not superseded
-        non_superseded = []
-        for fact in facts:
-            superseded_by = self.get_superseded_by(fact.id)
-            if not superseded_by:
-                non_superseded.append(fact)
-        
-        if not non_superseded:
-            # All are superseded, return the one with most supersedes
-            return max(facts, key=lambda f: len(self.get_supersedes_chain(f.id)))
-        
-        # Return the most recent non-superseded fact
-        return max(non_superseded, key=lambda f: f.valid_from or "")
-    
+        heads = [node_id for node_id in candidates
+            if versions.in_degree(node_id) == 0 and not candidates[node_id].get('is_archived')]
+        return Fact(**{**candidates[heads[0]], 'id': heads[0]}) if len(heads) == 1 else None
+
     # --- Hub penalty calculation ---
     
     def get_node_degree(self, node_id: str, direction: str = "total") -> int:

@@ -25,3 +25,19 @@ def test_one_sided_range_does_not_admit_old_or_unknown_occurrences():
     assert [e.id for e in g.get_events_by_time_range(end_time='2020')]==['old']
     with pytest.raises(ValueError):g.get_events_by_time_range('2022','2020')
     with pytest.raises(ValueError):g.get_events_by_time_range('invalid')
+
+
+def test_version_queries_follow_replacements_and_do_not_guess_across_forks():
+    g=GraphStore()
+    for key in ['old','new']:
+        g.add_node(Fact(id=key,subject_id='p',object_id='c_place',predicate='resident',content=key))
+    g._g.add_edge('new','old',rel_type='SUPERSEDES')
+    assert g.get_supersedes_chain('old')==['old','new']
+    assert g.get_latest_fact('p','resident').id=='new'
+    g.add_node(Fact(id='fork',subject_id='p',object_id='c_other',predicate='resident',content='Unresolved alternative'))
+    g._g.add_edge('fork','old',rel_type='SUPERSEDES')
+    assert g.get_supersedes_chain('old')==['old','fork','new']
+    assert g.get_latest_fact('p','resident') is None
+    g._g.add_edge('old','new',rel_type='SUPERSEDES')
+    assert set(g.get_supersedes_chain('old'))=={'old','new','fork'}
+    assert g.get_latest_fact('p','resident') is None
