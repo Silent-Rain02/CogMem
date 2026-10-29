@@ -69,12 +69,13 @@ def date_bounds(value):
     """Inclusive calendar-date bounds; coarse precision stays an interval."""
     if not isinstance(value, str):
         return None
-    if 'T' in value:
+    value = value.strip()
+    if 'T' in value or ' ' in value:
         try:
             point = datetime.fromisoformat(value.replace('Z', '+00:00')).date()
             return point, point
         except ValueError:
-            return None
+            pass
     normalized = normalize_event_time(value)
     if normalized is None:
         return None

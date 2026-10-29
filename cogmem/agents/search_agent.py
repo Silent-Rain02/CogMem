@@ -1498,7 +1498,7 @@ class SearchAgent:
             
             # 判断time_query是语义查询还是时间值
             # 时间值格式：YYYY, YYYY-MM, YYYY-MM-DD
-            is_time_value = bool(re.match(r'^\d{4}(-\d{2})?(-\d{2})?$', time_query_lower))
+            is_time_value = date_bounds(time_query) is not None
             
             for e in events:
                 match = False

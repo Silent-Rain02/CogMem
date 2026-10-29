@@ -71,3 +71,9 @@ def test_timeline_fact_fallback_requires_validity_not_a_year_mentioned_in_conten
     g._g.add_node('archived',node_type='fact',subject_id='p',content='Resident of Porto',valid_from='2020',is_archived=True)
     a=agent(g);a._current_query='';output=a._tool_scan_timeline(['p'],'2020')
     assert '[ID: right]' in output and '[ID: wrong]' not in output and '[ID: archived]' not in output
+
+
+def test_iso_wall_timestamp_is_a_calendar_time_not_a_semantic_keyword():
+    g=GraphStore();g._g.add_node('e',node_type='event',title='Meeting',time_start='2020-03-04 14:00:00')
+    a=agent(g);a._current_query=''
+    assert '[ID: e]' in a._tool_scan_timeline(['e'],'2020-03-04')

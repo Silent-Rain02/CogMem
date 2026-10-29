@@ -51,7 +51,7 @@ class Indexer:
         self._llm = create_llm_client(cfg)
         self._embed = EmbeddingEncoder(cfg)
         self._evidence = EvidenceStore()
-        self._chunk_store = chunk_store
+        self._chunk_store = chunk_store if chunk_store is not None else ChunkStore(cfg.model.embedding_dim, cfg.faiss.metric)
         self._cogmem = cogmem  # Reference to CogMem instance for saving
         # Concept manager for normalizing concepts
         self._concept_manager = get_default_manager()
@@ -834,6 +834,12 @@ class Indexer:
 
         # Parse JSON response (response is already a string)
         extraction_result = safe_json_loads(response)
+        if not isinstance(extraction_result, dict):
+            raise ValueError('Extraction response must be a structured object, not a failed parse')
+        for field in ('events', 'facts', 'claims'):
+            rows = extraction_result.get(field)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError(f'Extraction {field} must be an array of objects')
 
         # Post-process events: align extraction schema and normalize relative time expressions.
         session_date = session_date or question_date_iso

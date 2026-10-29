@@ -317,7 +317,7 @@ def test_retired_fact_consolidation_preserves_pipeline_call_contract():
 def test_unanchored_extraction_never_injects_wall_clock_date():
     instance = builder()
     prompts = []
-    instance._llm = SimpleNamespace(chat=lambda **kwargs: prompts.append(kwargs['user']) or '{}')
+    instance._llm = SimpleNamespace(chat=lambda **kwargs: prompts.append(kwargs['user']) or '{"events":[],"facts":[],"claims":[]}')
     instance._extract_structured_from_chunk('Morgan: Yesterday I walked.', 'undated')
     assert 'unknown (do not resolve relative dates)' in prompts[0]
 
