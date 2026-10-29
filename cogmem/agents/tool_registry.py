@@ -1,6 +1,7 @@
 """Tool registry: register and execute atomic tools with optional trace."""
 
 from __future__ import annotations
+from cogmem.models.execution_errors import raise_if_execution_failure
 
 import time
 from typing import Any, Callable, Dict, Optional
@@ -62,6 +63,7 @@ class ToolRegistry:
                     on_trace(entry)
             return result
         except Exception as e:
+            raise_if_execution_failure(e)
             latency_ms = (time.perf_counter() - start) * 1000
             result = ToolResult(
                 ok=False,

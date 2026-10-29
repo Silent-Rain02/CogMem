@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from .execution_errors import retryable_provider_error
 
 from ..config import CogMemConfig
 from ..utils.cache import LRUCache
@@ -81,7 +82,8 @@ class OpenAICompatClient(LLMClient):
         """获取嵌入模型名称"""
         return model or self._cfg.model.embedding_model
 
-    @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3))
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3),
+           retry=retry_if_exception(retryable_provider_error), reraise=True)
     def chat(self, system: str, user: str, model: Optional[str] = None) -> str:
         mdl = self._get_chat_model(model)
         options = {}
@@ -124,7 +126,8 @@ class OpenAICompatClient(LLMClient):
             METRICS.record_chat(latency_ms=latency_ms)
         return content
 
-    @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3))
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3),
+           retry=retry_if_exception(retryable_provider_error), reraise=True)
     def embed(self, texts: List[str], model: Optional[str] = None) -> List[List[float]]:
         mdl = self._get_embedding_model(model)
         dimensions = self._cfg.model.embedding_dimensions

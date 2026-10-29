@@ -1,4 +1,5 @@
 from __future__ import annotations
+from cogmem.models.execution_errors import raise_if_execution_failure
 
 import hashlib
 import json
@@ -87,6 +88,61 @@ class Indexer:
             return self._cfg.runtime.max_concurrency
 
     def add_documents(self, docs: Iterable[Doc], incremental: bool = False) -> None:
+        """Publish complete ingestion, never extraction-only checkpoints.
+
+        Source identity validation happens before remote work. All derived stores
+        and source references are staged together, so a provider interruption
+        cannot mark a partially indexed document as processed in the live bank.
+        """
+        from copy import copy, deepcopy
+        from ..storage.workspace import WorkspaceView, validate_workspace
+        documents = list(docs)
+        # Preserve the lightweight identity-only behavior for an empty increment.
+        if not documents:
+            return
+        # Validate identities before cloning large indexes or doing model work.
+        originals = {}
+        for doc in documents:
+            if doc.id in originals and originals[doc.id] != doc.text:
+                raise ValueError(f'Conflicting source document id: {doc.id!r}')
+            originals[doc.id] = doc.text
+        candidate_evidence = deepcopy(self._evidence)
+        candidate_evidence.register_documents(originals)
+        if incremental and set(originals) <= candidate_evidence.get_processed_doc_ids():
+            return
+        staged = copy(self)
+        staged._graph = deepcopy(self._graph)
+        staged._typed_vstore = deepcopy(self._typed_vstore) if self._typed_vstore is not None else None
+        staged._vstore = deepcopy(self._vstore) if self._vstore is not None else None
+        staged._chunk_store = deepcopy(self._chunk_store)
+        staged._evidence = candidate_evidence
+        staged._concept_manager = deepcopy(self._concept_manager)
+        staged._cogmem = None  # No incomplete checkpoint can overwrite a live workspace.
+        unique = {}
+        for doc in documents:unique.setdefault(doc.id, doc)
+        staged._add_documents_uncommitted(list(unique.values()), incremental)
+        missing = set(unique) - staged._evidence.get_processed_doc_ids()
+        if missing:
+            raise RuntimeError(f'Ingestion incomplete for {len(missing)} source documents; live workspace preserved')
+        view = WorkspaceView(staged._graph, staged._typed_vstore if staged._typed_vstore is not None else staged._vstore,
+                             staged._chunk_store, staged._evidence)
+        validate_workspace(self._cfg, view)
+        if self._cogmem is not None:
+            parent = self._cogmem
+            previous = WorkspaceView(self._graph, self._typed_vstore if self._typed_vstore is not None else self._vstore,
+                                     self._chunk_store, self._evidence)
+            parent._install_workspace(view)
+            try:
+                parent.save()
+            except BaseException:
+                parent._install_workspace(previous)
+                raise
+        else:
+            self._graph, self._typed_vstore, self._vstore = staged._graph, staged._typed_vstore, staged._vstore
+            self._chunk_store, self._evidence = staged._chunk_store, staged._evidence
+        self._concept_manager = staged._concept_manager
+
+    def _add_documents_uncommitted(self, docs: Iterable[Doc], incremental: bool = False) -> None:
         """
         统一的文档索引入口。
         通过 person-centered, event-mediated 的方式处理文档。
@@ -107,6 +163,8 @@ class Indexer:
                     "Use distinct document IDs or separate source namespaces/workspaces."
                 )
             source_texts[doc.id] = doc.text
+
+        self._evidence.register_documents(source_texts)
 
         if incremental:
             processed_doc_ids = self._evidence.get_processed_doc_ids()
@@ -266,6 +324,7 @@ class Indexer:
 
                 return doc_nodes, doc_relations, doc_chunks
             except Exception as e:
+                raise_if_execution_failure(e)
                 import traceback
                 # 安全地获取doc.id，防止doc不是预期的对象
                 doc_id = "unknown"
@@ -274,7 +333,8 @@ class Indexer:
                         doc_id = doc.id
                     elif hasattr(doc, '__str__'):
                         doc_id = str(doc)
-                except Exception:
+                except Exception as execution_error:
+                    raise_if_execution_failure(execution_error)
                     pass  # 保持 doc_id = "unknown"
                 
                 print(f"[!]  处理文档 {doc_id} 时出错: {type(e).__name__}: {str(e)}")
@@ -288,7 +348,8 @@ class Indexer:
                         if hasattr(doc, 'text'):
                             print(f"     doc.text 类型: {type(doc.text)}")
                             print(f"     doc.text 值: {repr(doc.text)[:100]}")
-                    except Exception:
+                    except Exception as execution_error:
+                        raise_if_execution_failure(execution_error)
                         pass
                 
                 # 始终打印完整堆栈（用于调试）
@@ -364,6 +425,7 @@ class Indexer:
                                     print(f"[!]  文档 {doc.id} 返回空结果，将重试")
                             
                         except Exception as e:
+                            raise_if_execution_failure(e)
                             if isinstance(e, KeyboardInterrupt):
                                 raise
                             # 捕获超时或其他错误，记录需要重试的文档
@@ -426,6 +488,7 @@ class Indexer:
                             self._cogmem.save()
                             print(f"  [OK] 已保存检查点（图中有 {self._graph.num_entities()} 个节点）")
                         except Exception as save_err:
+                            raise_if_execution_failure(save_err)
                             print(f"  [ERR] 保存检查点失败: {str(save_err)}")
                     
                     raise
@@ -459,6 +522,7 @@ class Indexer:
                         else:
                             print(f"  [ERR] 文档 {doc.id} 最终重试仍返回空结果")
                     except Exception as e:
+                        raise_if_execution_failure(e)
                         print(f"  [ERR] 文档 {doc.id} 最终重试失败: {str(e)[:100]}")
             
             # 如果还有未处理的文档，打印最终统计
@@ -510,6 +574,7 @@ class Indexer:
                         self._cogmem.save()
                         print(f"  [OK] 已保存检查点（图中有 {self._graph.num_entities()} 个节点）")
                     except Exception as save_err:
+                        raise_if_execution_failure(save_err)
                         print(f"  [ERR] 保存检查点失败: {str(save_err)}")
 
         # 4. 去重和存图（在循环外批量处理）
@@ -653,6 +718,7 @@ class Indexer:
                     self._cogmem.save()
                     print("  [OK] 节点已保存（向量将在下次索引时补充）")
                 except Exception as save_err:
+                    raise_if_execution_failure(save_err)
                     print(f"  [ERR] 保存失败: {str(save_err)}")
             raise
 
@@ -678,8 +744,7 @@ class Indexer:
                     print(f"  [OK] 文档片段向量化完成")
                 except KeyboardInterrupt:
                     print("\n[!]  Chunk嵌入被中断")
-                    # Chunk 嵌入中断不影响主索引
-                    pass
+                    raise
             else:
                 # P0 FIX: Pure Graph Mode下仍然索引chunks用于Naive RAG fallback
                 # 即使不启用chunk embedding，也要生成向量并存储，确保fallback机制可用
@@ -700,8 +765,9 @@ class Indexer:
                     print(f"  [OK] Chunk向量化完成（用于Naive RAG fallback）")
                 except KeyboardInterrupt:
                     print("\n[!]  Chunk嵌入被中断")
-                    pass
+                    raise
                 except Exception as e:
+                    raise_if_execution_failure(e)
                     # 如果fallback索引失败，记录警告但不影响主索引
                     print(f"  [!] 警告：Chunk fallback索引失败: {e}")
                     print(f"  [Indexer] 系统将无法使用Naive RAG fallback机制")
@@ -723,6 +789,7 @@ class Indexer:
                 self._cogmem.save()
                 print(f"  [OK] 最终保存完成")
             except Exception as save_err:
+                raise_if_execution_failure(save_err)
                 print(f"  [WARN] 最终保存失败: {str(save_err)}")
                 # 不抛出异常，允许继续执行
 
@@ -897,6 +964,7 @@ class Indexer:
                     return f"{year:04d}-{month:02d}-{day:02d}"
 
         except Exception as e:
+            raise_if_execution_failure(e)
             print(f"[WARN] Failed to parse session date '{date_str}': {e}")
 
         return None
@@ -1689,6 +1757,7 @@ class Indexer:
 
             print(f"  [OK] 节点向量化完成，共生成 {len(all_embeddings)} 个向量")
         except Exception as e:
+            raise_if_execution_failure(e)
             print(f"[!]  节点嵌入失败: {e}")
             # 如果是embedding维度问题，提供详细错误
             if "dimension" in str(e).lower():
@@ -1890,7 +1959,8 @@ class Indexer:
                                                 time_str = time_start.split('T')[0] if 'T' in time_start else time_start
                                                 parts.append(f"related to event on {time_str}")
                                                 break
-                        except Exception:
+                        except Exception as execution_error:
+                            raise_if_execution_failure(execution_error)
                             pass
 
         elif isinstance(node, Claim):

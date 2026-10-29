@@ -6,6 +6,7 @@ v3.3 Enhancements:
 - Enhanced evidence grounding
 - Improved tool suggestion based on question patterns
 """
+from cogmem.models.execution_errors import raise_if_execution_failure
 
 import json
 import re
@@ -399,7 +400,8 @@ class SearchAgent:
         if not data:
             try:
                 data = json.loads(text)
-            except Exception:
+            except Exception as execution_error:
+                raise_if_execution_failure(execution_error)
                 data = {}
 
         if isinstance(data, dict) and data:
@@ -431,7 +433,8 @@ class SearchAgent:
             if not params:
                 try:
                     params = json.loads(raw_args)
-                except Exception:
+                except Exception as execution_error:
+                    raise_if_execution_failure(execution_error)
                     params = {}
 
         return {
@@ -726,6 +729,7 @@ class SearchAgent:
                             if evidence_obs and len(evidence_obs) > 50:
                                 final_fallback_answer = f"{final_fallback_answer}\n\nSupporting evidence: {evidence_obs[:300]}..."
                     except Exception as e:
+                        raise_if_execution_failure(e)
                         if verbose:
                             print(f"[SearchAgent] Failed to fetch evidence: {e}")
 
@@ -1098,6 +1102,7 @@ class SearchAgent:
             res = self.tools[name](**params)
             return str(res)
         except Exception as e:
+            raise_if_execution_failure(e)
             return f"Tool Error: {str(e)}"
 
     def _validate_and_fix_tool_name(self, name: str) -> str:
@@ -1124,7 +1129,8 @@ class SearchAgent:
         if not query_or_id:
             return None
         if query_or_id in getattr(self.graph_service.graph_store, "_g", {}):
-            return query_or_id
+            node = self.graph_service.graph_store.get_node(query_or_id)
+            return query_or_id if node and not node.get('is_archived') and (not types or node.get('node_type') in types) else None
         anchors = self.graph_service.find_anchors(query_or_id, types=types, top_k=1)
         if anchors:
             return anchors[0].node_id
@@ -1212,7 +1218,8 @@ class SearchAgent:
             if not data:
                 try:
                     data = json.loads(resp)
-                except Exception:
+                except Exception as execution_error:
+                    raise_if_execution_failure(execution_error)
                     data = {}
             if not data and isinstance(resp, str):
                 stripped = resp.strip()
@@ -1220,7 +1227,8 @@ class SearchAgent:
                     data = {"can_answer": True, "answer": stripped.split(":", 1)[1].strip(), "confidence": "medium"}
                 elif stripped.upper().startswith("NO:"):
                     data = {"can_answer": False, "missing": stripped.split(":", 1)[1].strip()}
-        except Exception:
+        except Exception as execution_error:
+            raise_if_execution_failure(execution_error)
             return None
         if not isinstance(data, dict):
             return None
@@ -1279,21 +1287,14 @@ class SearchAgent:
         )
 
     def _normalize_tool_time_query(self, time_query: str) -> str:
-        """Normalize natural-language time expressions into a compact query string."""
+        """Normalize a complete calendar expression without dropping qualifiers."""
+        from ..utils.temporal import normalize_event_time
         if not time_query:
             return ""
-        lowered = time_query.lower()
-        for season in ("spring", "summer", "fall", "autumn", "winter"):
-            if season in lowered:
-                return "fall" if season == "autumn" else season
-        try:
-            from cogmem.utils.temporal_parser import normalize_time_format
-            normalized = normalize_time_format(time_query)
-            if normalized:
-                return normalized.replace("-XX", "")
-        except Exception:
-            pass
-        return time_query
+        text = time_query.strip()
+        if text.lower() == 'autumn':
+            return 'fall'
+        return normalize_event_time(text) or text
 
     def _tool_find_anchors(self, query: str, types: List[str] = None, top_k: Optional[int] = None, include_evidence: bool = False) -> str:
         # 使用配置的默认值，如果调用时指定了 top_k 则使用指定的值
@@ -1315,7 +1316,8 @@ class SearchAgent:
                             [chunk[:150] + "..." if len(chunk) > 150 else chunk for chunk in evidence_chunks]
                         )
                         results.append(f"  [Original Text] {evidence_text}")
-                except Exception:
+                except Exception as execution_error:
+                    raise_if_execution_failure(execution_error)
                     pass  # 如果获取证据失败，继续处理其他节点
         
         return "\n".join(results)
@@ -1335,7 +1337,7 @@ class SearchAgent:
                                 'when', 'where', 'what happened', 'memory']
             node_types = ['event', 'fact'] if any(kw in query_lower for kw in specific_keywords) else ['fact', 'event']
 
-        expansion = getattr(self.config.agent, 'vector_search_expansion_factor', 2.0) if getattr(self, 'config', None) and getattr(self.config, 'agent', None) else 2.0
+        expansion = getattr(self, 'vector_search_expansion_factor', 2.0)
         per_type_k = max(1, int(top_k * expansion))
 
         try:
@@ -1350,10 +1352,11 @@ class SearchAgent:
                 for nt in node_types:
                     raw_results.extend(vstore.search_by_type(query_embedding, nt, top_k=per_type_k))
                 raw_results.sort(key=lambda x: x[1], reverse=True)
-                raw_results = raw_results[:top_k * 3]
+                # Filter and apply the existing importance score before final top-k.
             else:
                 raw_results = vstore.search(query_embedding, top_k=top_k * 3)
         except Exception as e:
+            raise_if_execution_failure(e)
             return f"Semantic search failed: {e}"
 
         results_by_type = {nt: [] for nt in node_types}
@@ -1406,7 +1409,15 @@ class SearchAgent:
                 -self._score_query_node(result.target_node or {}, focus_terms),
                 result.target_id, result.source_id, result.relation_type,
             ))
-        selected = res[:self.traverse_neighbors_max_results]
+        selected = []
+        seen = set()
+        for result in res:
+            if result.target_id in seen:
+                continue
+            seen.add(result.target_id)
+            selected.append(result)
+            if len(selected) >= self.traverse_neighbors_max_results:
+                break
         self._remember_tool_hits("traverse_neighbors", [r.target_id for r in selected])
         return "\n".join([f"[{r.relation_type}] -> [ID: {r.target_id}] {self._format_node_to_rich_text(r.target_node or {}, r.target_id)}" for r in selected])
     
@@ -1461,7 +1472,7 @@ class SearchAgent:
         seen_ids = set()
         focus_terms = self._extract_focus_terms(self._current_query or "")
         for r in person_results:
-            if r.target_node and r.target_node.get("node_type") == "event":
+            if r.target_node and r.target_node.get("node_type") == "event" and not r.target_node.get('is_archived'):
                 event_id = r.target_id
                 if event_id not in seen_ids:
                     event_payload = dict(r.target_node)
@@ -1471,9 +1482,9 @@ class SearchAgent:
         
         # 2. 如果直接提供了 Event ID，也加入
         for eid in entity_ids:
-            if eid.startswith("event_") and eid not in seen_ids:
+            if eid not in seen_ids:
                 node = self.graph_service.graph_store.get_node(eid)
-                if node:
+                if node and node.get('node_type') == 'event' and not node.get('is_archived'):
                     event_payload = dict(node)
                     event_payload["id"] = eid
                     events.append(event_payload)
@@ -1495,9 +1506,7 @@ class SearchAgent:
                     match = _matches_season(e, time_query_lower)
                 elif is_time_value:
                     # Recording time is never a substitute for occurrence time.
-                    effective = (normalize_event_time(e.get('time_start')) or
-                                 normalize_event_time(e.get('time_resolved')))
-                    bounds = date_bounds(effective)
+                    bounds = date_bounds(e.get('time_start')) or date_bounds(e.get('time_resolved'))
                     requested = date_bounds(time_query_lower)
                     match = bool(bounds and requested and bounds[0] <= requested[1] and requested[0] <= bounds[1])
                 else:
@@ -1551,13 +1560,21 @@ class SearchAgent:
                 node_data = self.graph_service.graph_store.get_node(node_id) or raw_node
                 if not node_data or node_data.get("node_type") != "fact":
                     continue
-                if node_data.get("subject_id") not in entity_ids:
+                if node_data.get("subject_id") not in entity_ids or node_data.get('is_archived'):
                     continue
                 content = str(node_data.get("content", "")).lower()
                 if focus_terms and not any(term in content for term in focus_terms):
                     continue
-                if time_query_lower and time_query_lower != "*" and time_query_lower not in content:
-                    continue
+                if time_query_lower and time_query_lower != "*":
+                    requested = date_bounds(time_query_lower)
+                    if requested:
+                        start = date_bounds(node_data.get('valid_from'))
+                        end = date_bounds(node_data.get('valid_to'))
+                        start, end = start or end, end or start
+                        if not (start and end and start[0] <= requested[1] and requested[0] <= end[1]):
+                            continue
+                    elif time_query_lower not in content:
+                        continue
                 fact_matches.append({**node_data, "id": node_data.get("id") or node_id})
             fact_matches.sort(
                 key=lambda item: (
@@ -1683,6 +1700,10 @@ class SearchAgent:
         """Direct claim lookup for opinion/judgment questions."""
         resolved_target_id = target_id or self._resolve_entity_id(target, types=["person", "concept"])
         resolved_source_id = source_id or self._resolve_entity_id(source, types=["person"])
+        if source and not resolved_source_id:
+            return "No source found for the requested claim attribution."
+        if target and not resolved_target_id:
+            return "No target found for the requested claim attribution."
         if not resolved_target_id and not resolved_source_id:
             return "No source or target found for claim_lookup."
         claims = self.graph_service.find_claims_about_target(
@@ -1801,6 +1822,7 @@ class SearchAgent:
                         }
                         common_nodes.append(pattern_node)
             except Exception as e:
+                raise_if_execution_failure(e)
                 # Silently fail if semantic matching fails
                 pass
         
@@ -2060,7 +2082,8 @@ class SearchAgent:
             )
             if refined and not self._is_low_signal_answer(refined):
                 return refined
-        except Exception:
+        except Exception as execution_error:
+            raise_if_execution_failure(execution_error)
             return None
         return None
 
@@ -2215,10 +2238,15 @@ class SearchAgent:
                 if node in visited:continue
                 visited.add(node)
                 direct=self.evidence_store.get_chunks(node,limit=None)
-                if direct:
-                    scope.extend(direct)
-                    continue
-                # Follow only explicit provenance edges; never search unrelated raw history.
+                scope.extend(direct)
+                chunk_store = getattr(self.graph_service, 'chunk_store', None)
+                if chunk_store is not None:
+                    original = chunk_store.get_chunk(node)
+                    if original is not None:
+                        scope.append(original.text)
+                # Cached sources and explicit provenance are complementary. A
+                # partial direct cache must not conceal other declared supports.
+                # Follow only provenance edges; never search unrelated raw history.
                 if network is not None and node in network:
                     pending.extend(target for _,target,data in network.out_edges(node,data=True)
                         if (data.get('rel_type') or data.get('relation_type'))=='SUPPORTED_BY' and target not in visited)
@@ -2230,6 +2258,7 @@ class SearchAgent:
             else:
                 chunks=scope[:limit]
         except Exception as error:
+            raise_if_execution_failure(error)
             return f"Error retrieving evidence: {str(error)}"
         if not chunks:
             return f"No original text evidence found for graph nodes: {requested}"

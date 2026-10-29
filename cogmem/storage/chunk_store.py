@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Tuple
 
 import faiss  # type: ignore
 import numpy as np
+from .vector_store import validate_vectors, validate_snapshot
 
 @dataclass
 class Chunk:
@@ -33,30 +34,39 @@ class ChunkStore:
 
     def add(self, chunks: List[Chunk], vectors: List[List[float]]) -> None:
         """添加chunks，自动去重（基于chunk.id）"""
-        if not chunks or not vectors:
+        if not chunks and not vectors:
             return
-        
-        # 去重：只添加新chunk（基于ID）
-        existing_chunk_ids = {c.id for c in self._chunks}
-        new_chunks: List[Chunk] = []
-        new_vectors: List[List[float]] = []
-        
-        for chunk, vec in zip(chunks, vectors):
-            if chunk.id not in existing_chunk_ids:
-                new_chunks.append(chunk)
-                new_vectors.append(vec)
-        
+        # Validate the full batch before storing any source or vector.
+        arr = validate_vectors([c.id for c in chunks], vectors, self._dim)
+        known = {c.id: c for c in self._chunks}
+        new_chunks, positions = [], []
+        for i, chunk in enumerate(chunks):
+            if chunk.id in known:
+                if known[chunk.id] != chunk:
+                    raise ValueError('A chunk address cannot identify different original source content')
+                continue
+            known[chunk.id] = chunk
+            new_chunks.append(replace(chunk))
+            positions.append(i)
         if not new_chunks:
-            return  # 所有chunk都已存在
-        
-        arr = np.asarray(new_vectors, dtype=np.float32)
+            return
+        arr = arr[positions]
         if self._metric == "cosine":
             arr = self._normalize(arr)
         self._index.add(arr)
         self._chunks.extend(new_chunks)
 
+    def get_chunk(self, chunk_id: str) -> Chunk | None:
+        """Resolve an exact source address without a corpus search or mutation."""
+        for chunk in self._chunks:
+            if chunk.id == chunk_id:
+                return replace(chunk)
+        return None
+
     def search(self, query_vec: List[float], top_k: int = 10) -> List[Tuple[Chunk, float]]:
-        q = np.asarray([query_vec], dtype=np.float32)
+        if top_k <= 0:
+            return []
+        q = validate_vectors(["query"], [query_vec], self._dim)
         if self._metric == "cosine":
             q = self._normalize(q)
         D, I = self._index.search(q, top_k)
@@ -94,12 +104,21 @@ class ChunkStore:
             pickle.dump(self._chunks, f)
 
     def load(self, index_path: str, chunks_path: str) -> None:
-        if os.path.exists(index_path):
-            self._index = faiss.read_index(index_path)
-        if os.path.exists(chunks_path):
-            import pickle
-            with open(chunks_path, "rb") as f:
-                self._chunks = pickle.load(f)
+        present = (os.path.exists(index_path), os.path.exists(chunks_path))
+        if any(present) and not all(present):
+            raise ValueError('Incomplete chunk snapshot: index and original metadata are both required')
+        if not any(present):
+            empty = ChunkStore(self._dim, self._metric)
+            self._index, self._chunks = empty._index, []
+            return
+        import pickle
+        index = faiss.read_index(index_path)
+        with open(chunks_path, "rb") as f:
+            chunks = pickle.load(f)
+        if not isinstance(chunks, list) or any(not isinstance(c, Chunk) for c in chunks):
+            raise ValueError('Invalid original chunk metadata')
+        validate_snapshot(index, [c.id for c in chunks], self._dim, self._metric)
+        self._index, self._chunks = index, chunks
 
     def size(self) -> int:
         return len(self._chunks)

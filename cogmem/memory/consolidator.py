@@ -15,6 +15,7 @@ v3.3 Enhancements:
 """
 
 from __future__ import annotations
+from cogmem.models.execution_errors import raise_if_execution_failure
 
 import json
 import hashlib
@@ -64,13 +65,15 @@ class MemoryConsolidator:
         graph: GraphStore,
         vector_store: TypedVectorStore,
         embedding_encoder: EmbeddingEncoder,
-        evidence_store=None  # P0 FIX: Add evidence_store support
+        evidence_store=None,
+        chunk_store=None
     ):
         self.config = config
         self.graph = graph
         self.vector_store = vector_store
         self.embedding_encoder = embedding_encoder
-        self.evidence_store = evidence_store  # P0 FIX: Store reference
+        self.evidence_store = evidence_store  # Source references must follow the same workspace.
+        self.chunk_store = chunk_store
         self.llm: LLMClient = create_llm_client(config)
         
         # Initialize sub-components
@@ -109,7 +112,9 @@ class MemoryConsolidator:
             Statistics dictionary with consolidation results
         """
         # Determine which persons to process
-        if affected_person_ids:
+        from datetime import timezone
+        started_at = datetime.now(timezone.utc).isoformat()
+        if affected_person_ids is not None:
             persons_to_process = affected_person_ids
         elif since_timestamp:
             # Find persons with new events since timestamp
@@ -129,39 +134,44 @@ class MemoryConsolidator:
         )
         
         # Update last consolidation timestamp
-        self._last_consolidation_timestamp = datetime.now().isoformat()
+        if not stats.get('errors') and not stats.get('synthesis_failed'):
+            # Checkpoint the start, so writes arriving during consolidation are
+            # reconsidered next time; a failed pass never advances the cursor.
+            self._last_consolidation_timestamp = started_at
         
         return stats
 
+    @staticmethod
+    def _change_timestamp(value):
+        """Normalize ISO instants; legacy naive wall times use host local zone."""
+        from datetime import timezone
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.astimezone(timezone.utc)
+
     def _find_affected_persons(self, since_timestamp: str) -> List[str]:
-        """Find persons with new events since timestamp (v3.3 Enhancement)"""
-        affected_persons = set()
-        
-        try:
-            since_dt = datetime.fromisoformat(since_timestamp.replace('Z', '+00:00'))
-        except ValueError:
-            return []
-        
-        # Iterate through all Event nodes
-        for node_id, node_data in self.graph._g.nodes(data=True):
-            if not node_data or node_data.get('node_type') != NodeTypeEnum.EVENT.value:
+        """Find changed event participants; unknown change times cannot be skipped."""
+        since_dt = self._change_timestamp(since_timestamp)
+        affected = set()
+        for event_id, node in self.graph._g.nodes(data=True):
+            if not node or node.get('node_type') != NodeTypeEnum.EVENT.value:
                 continue
-            
-            # Check if event was created after since_timestamp
-            metadata = node_data.get('metadata', {})
-            created_at = metadata.get('created_at') if isinstance(metadata, dict) else None
-            
-            if created_at:
-                try:
-                    created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    if created_dt > since_dt:
-                        # Find participants of this event
-                        participants = node_data.get('participants', [])
-                        affected_persons.update(participants)
-                except ValueError:
-                    continue
-        
-        return list(affected_persons)
+            metadata = node.get('metadata') or {}
+            times = []
+            unknown = False
+            for field in ('created_at', 'updated_at'):
+                value = metadata.get(field) if isinstance(metadata, dict) else None
+                if value:
+                    try:
+                        times.append(self._change_timestamp(value))
+                    except (ValueError, TypeError, AttributeError):
+                        unknown = True
+            if not unknown and times and max(times) < since_dt:
+                continue
+            affected.update(node.get('participants') or [])
+            for source, _, data in self.graph._g.in_edges(event_id, data=True):
+                if (data.get('rel_type') or data.get('relation_type')) == 'PARTICIPATED_IN':
+                    affected.add(source)
+        return sorted(affected)
 
     def build_concept_hierarchy(self) -> Dict[str, List[str]]:
         """Build concept hierarchy relationships (v3.3 Enhancement)
@@ -258,7 +268,8 @@ class MemoryConsolidator:
         concept_high_threshold: float = 0.95,
         fact_high_threshold: float = 0.95,
         max_supported_by_per_fact: int = 5,
-        cleanup_archived: bool = True
+        cleanup_archived: bool = True,
+        max_time_window_days: int = 30
     ) -> Dict[str, Any]:
         """Run memory consolidation process
         
@@ -274,7 +285,7 @@ class MemoryConsolidator:
             concept_similarity_threshold: Threshold for concept similarity (default: 0.90)
             concept_high_threshold: High similarity threshold for full concept merge (default: 0.95)
             fact_high_threshold: High similarity threshold for full fact merge (default: 0.95)
-            max_supported_by_per_fact: Maximum SUPPORTED_BY edges per fact (default: 5)
+            max_supported_by_per_fact: Deprecated write cap; all provenance links are retained, read limits apply later
             cleanup_archived: Whether to delete archived nodes after consolidation (default: True)
         
         Returns:
@@ -282,6 +293,10 @@ class MemoryConsolidator:
         """
         import time
         from ..utils.metrics import METRICS
+        if type(max_time_window_days) is not int or max_time_window_days < 0:
+            raise ValueError('Consolidation window must be a nonnegative number of calendar days')
+        if type(min_events) is not int or min_events < 1:
+            raise ValueError('Consolidation requires a positive count of distinct source events')
         
         stats = {
             "persons_processed": 0,
@@ -292,15 +307,27 @@ class MemoryConsolidator:
             "facts_deduplicated": 0,
             "claims_reconciled": 0,
             "errors": [],
+            "time_window_days": max_time_window_days,
+            "event_concept_pairs_without_bounded_time": 0,
             "phase_costs": {}  # 记录各阶段的详细开销
         }
 
-        # Load graph if source_workspace is specified
+        # Validate export targets before synthesis or any graph mutation.
+        from pathlib import Path
+        if target_workspace:
+            target = Path(target_workspace)
+            if target.exists() and (not target.is_dir() or any(target.iterdir())):
+                raise FileExistsError('Consolidation export requires a new or empty target workspace')
+            if not source_workspace and (self.evidence_store is None or getattr(self, 'chunk_store', None) is None):
+                raise ValueError('Export requires complete original chunks and evidence references')
         if source_workspace:
-            from ..cogmem import CogMem
-            source_cogmem = CogMem(workspace_dir=source_workspace, auto_load=True)
-            self.graph = source_cogmem.graph
-            self.vector_store = source_cogmem.vstore
+            from ..storage.workspace import read_workspace
+            source = Path(source_workspace)
+            if not (source / self.config.graph_file).is_file():
+                raise FileNotFoundError('Consolidation source workspace is missing its graph')
+            view = read_workspace(self.config, source)
+            self.graph, self.vector_store = view.graph, view.vectors
+            self.evidence_store, self.chunk_store = view.evidence, view.chunks
             # Re-initialize sub-components with new graph
             self.concept_merger = ConceptMerger(
                 graph=self.graph,
@@ -376,7 +403,6 @@ class MemoryConsolidator:
 
         # OPTIMIZATION: Collect all synthesis tasks first, then batch process
         synthesis_tasks = []
-        task_metadata = []  # Store (person_id, concept_id, event_list) for later use
         
         for person_id, person_data in person_nodes:
             try:
@@ -394,16 +420,18 @@ class MemoryConsolidator:
 
                 # Collect synthesis tasks (skip if stable Fact already exists for this person+concept)
                 for concept_id, event_list in concept_clusters.items():
-                    if len(event_list) < min_events:
-                        continue  # Skip clusters with too few events
-                    if self._has_synthesis_for(person_id, concept_id, event_list):
-                        continue  # Reduce duplicate synthesis
-
-                    stats["events_clustered"] += len(event_list)
-                    synthesis_tasks.append((person_id, person_name, concept_id, event_list))
-                    task_metadata.append((person_id, concept_id, event_list))
+                    stats['event_concept_pairs_without_bounded_time'] += sum(
+                        self._event_bounds(e) is None or
+                        (self._event_bounds(e)[1] - self._event_bounds(e)[0]).days > max_time_window_days
+                        for e in event_list)
+                    for window in self._bounded_event_windows(event_list, max_time_window_days):
+                        if len(window) < min_events or self._has_synthesis_for(person_id, concept_id, window):
+                            continue
+                        stats['events_clustered'] += len(window)
+                        synthesis_tasks.append((person_id, person_name, concept_id, window))
 
             except Exception as e:
+                raise_if_execution_failure(e)
                 import traceback
                 error_msg = f"Error collecting tasks for person {person_id}: {str(e)}"
                 error_details = traceback.format_exc()
@@ -424,17 +452,7 @@ class MemoryConsolidator:
                 stats["errors"].append(f"{stats['synthesis_failed']} fact synthesis tasks failed")
             
             # Create fact nodes from results
-            for (person_id, concept_id), fact_data in fact_results:
-                # Find corresponding event_list from task_metadata
-                event_list = None
-                for meta_person_id, meta_concept_id, meta_event_list in task_metadata:
-                    if meta_person_id == person_id and meta_concept_id == concept_id:
-                        event_list = meta_event_list
-                        break
-                
-                if not event_list:
-                    continue
-                
+            for (person_id, person_name, concept_id, event_list), fact_data in fact_results:
                 # Create Fact node and link it
                 try:
                     fact_id = self._create_fact_node(
@@ -456,6 +474,7 @@ class MemoryConsolidator:
                         if not (hasattr(self.config.runtime, 'quiet') and self.config.runtime.quiet):
                             print(f"[Consolidator] {error_msg}")
                 except Exception as e:
+                    raise_if_execution_failure(e)
                     error_msg = f"Error creating fact for {person_id} + {concept_id}: {str(e)}"
                     stats["errors"].append(error_msg)
                     import traceback
@@ -556,19 +575,17 @@ class MemoryConsolidator:
                         try:
                             self.vector_store.remove_typed(node_id, node_type)
                             archived_count += 1
-                        except Exception:
+                        except Exception as execution_error:
+                            raise_if_execution_failure(execution_error)
                             pass
             if archived_count > 0:
                 stats["archived_removed_from_index"] = archived_count
                 print(f"[Consolidator] Cleanup: removed {archived_count} archived node(s) from vector index")
 
-        # Save to target workspace if specified
         if target_workspace:
-            from ..cogmem import CogMem
-            target_cogmem = CogMem(workspace_dir=target_workspace)
-            target_cogmem.graph = self.graph
-            target_cogmem.vstore = self.vector_store
-            target_cogmem.save()
+            from ..storage.workspace import WorkspaceView, export_workspace
+            export_workspace(self.config, target_workspace,
+                WorkspaceView(self.graph, self.vector_store, self.chunk_store, self.evidence_store))
 
         # ===== Summary =====
         print("\n" + "="*60)
@@ -598,6 +615,7 @@ class MemoryConsolidator:
     def _get_participated_events(self, person_id: str) -> List[Dict[str, Any]]:
         """Get all events where the person participated"""
         events = []
+        seen = set()
         
         # Get outgoing edges with PARTICIPATED_IN or INVOLVED_IN
         for _, target_id, edge_data in self.graph._g.out_edges(person_id, data=True):
@@ -605,7 +623,9 @@ class MemoryConsolidator:
             if rel_type in ('PARTICIPATED_IN', 'INVOLVED_IN'):
                 # Get event node data
                 event_data = self.graph.get_node(target_id)
-                if event_data and event_data.get('node_type') == NodeTypeEnum.EVENT.value:
+                if (event_data and event_data.get('node_type') == NodeTypeEnum.EVENT.value
+                        and not event_data.get('is_archived') and target_id not in seen):
+                    seen.add(target_id)
                     event_data['id'] = target_id  # Ensure ID is present
                     events.append(event_data)
         
@@ -614,6 +634,7 @@ class MemoryConsolidator:
     def _cluster_events_by_concept(self, events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
         """Cluster events by the Concepts they involve"""
         clusters = defaultdict(list)
+        seen = set()
 
         for event in events:
             event_id = event.get('id', '')
@@ -624,10 +645,48 @@ class MemoryConsolidator:
                 rel_type = edge_data.get('rel_type', '')
                 if rel_type == 'INVOLVES':
                     concept_data = self.graph.get_node(concept_id)
-                    if concept_data and concept_data.get('node_type') == NodeTypeEnum.CONCEPT.value:
+                    if (concept_data and concept_data.get('node_type') == NodeTypeEnum.CONCEPT.value
+                            and (concept_id, event_id) not in seen):
+                        seen.add((concept_id, event_id))
                         clusters[concept_id].append(event)
 
         return dict(clusters)
+
+    @staticmethod
+    def _event_bounds(event):
+        from ..utils.temporal import date_bounds
+        start = date_bounds(event.get('time_start')) or date_bounds(event.get('time_resolved'))
+        end = date_bounds(event.get('time_end')) if event.get('time_end') else start
+        if not start or not end or start[0] > end[1]:
+            return None
+        return start[0], end[1]
+
+    @classmethod
+    def _bounded_event_windows(cls, events, max_days):
+        """Maximal source sets whose entire known occurrence spans fit a window.
+
+        Unknown/coarse intervals are retained as original events, not forced
+        onto a recording date. Maximal windows avoid redundant subset summaries;
+        distinct overlapping windows retain their exact independent support.
+        """
+        from datetime import timedelta
+        known = {}
+        for event in events:
+            bounds = cls._event_bounds(event)
+            if event.get('id') and bounds and (bounds[1] - bounds[0]).days <= max_days:
+                known[event['id']] = (bounds, event)
+        ordered = sorted(known.values(), key=lambda row: (row[0][0], row[0][1], row[1]['id']))
+        candidates = {}
+        for bounds, _ in ordered:
+            from datetime import date
+            try:
+                limit = bounds[0] + timedelta(days=max_days)
+            except OverflowError:
+                limit = date.max
+            rows = [event for interval, event in ordered if bounds[0] <= interval[0] and interval[1] <= limit]
+            candidates[frozenset(event['id'] for event in rows)] = rows
+        return [rows for keys, rows in candidates.items()
+                if keys and not any(keys < other for other in candidates)]
 
     def _has_synthesis_for(self, person_id, concept_id, events):
         """Skip only a derived fact built from this exact source set."""
@@ -704,18 +763,23 @@ class MemoryConsolidator:
                 print(f"[Consolidator] Failed to parse LLM response: {response[:200]}")
                 return None
 
-            # Validate required fields
-            if 'content' not in fact_data or 'predicate' not in fact_data:
-                print(f"[Consolidator] Missing required fields in fact_data: {fact_data}")
+            # The task fixes source/subject/concept identities. The model may
+            # describe a proposition but cannot invent a different graph address.
+            for field in ['content', 'predicate']:
+                if not isinstance(fact_data.get(field), str) or not fact_data[field].strip():
+                    return None
+            if fact_data.get('object_id') not in (None, concept_id):
                 return None
-
-            # Ensure object_id is set
-            if 'object_id' not in fact_data:
-                fact_data['object_id'] = concept_id
-
+            confidence = fact_data.get('confidence', 0.7)
+            import math
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                return None
+            fact_data = dict(fact_data)
+            fact_data['object_id'] = concept_id
             return fact_data
 
         except Exception as e:
+            raise_if_execution_failure(e)
             print(f"[Consolidator] Error synthesizing fact: {e}")
             return None
     
@@ -723,7 +787,7 @@ class MemoryConsolidator:
         self,
         tasks: List[Tuple[str, str, str, List[Dict[str, Any]]]],
         max_workers: int = 10
-    ) -> List[Tuple[Tuple[str, str], Dict[str, Any]]]:
+    ) -> List[Tuple[Tuple[str, str, str, List[Dict[str, Any]]], Dict[str, Any]]]:
         """Batch synthesize facts with concurrency (OPTIMIZATION)
         
         Args:
@@ -731,7 +795,7 @@ class MemoryConsolidator:
             max_workers: Maximum concurrent LLM calls (default: 10)
         
         Returns:
-            List of ((person_id, concept_id), fact_data) tuples
+            List of (original_task_including_exact_support_events, fact_data) tuples
         """
         results = []
         
@@ -745,13 +809,7 @@ class MemoryConsolidator:
         
         with ThreadPoolExecutor(max_workers=actual_workers) as executor:
             # Submit all tasks
-            futures = {
-                executor.submit(
-                    self._synthesize_fact,
-                    person_id, person_name, concept_id, events
-                ): (person_id, concept_id) 
-                for person_id, person_name, concept_id, events in tasks
-            }
+            futures = {executor.submit(self._synthesize_fact, *task): task for task in tasks}
             
             # Collect results with progress bar
             for future in tqdm(as_completed(futures), total=len(futures), desc="Synthesizing Facts", disable=self.config.runtime.max_concurrency > 1):
@@ -760,7 +818,8 @@ class MemoryConsolidator:
                     if fact_data:
                         results.append((futures[future], fact_data))
                 except Exception as e:
-                    person_id, concept_id = futures[future]
+                    raise_if_execution_failure(e)
+                    person_id, _, concept_id, _ = futures[future]
                     print(f"[Consolidator] Error synthesizing fact for {person_id} + {concept_id}: {e}")
         
         print(f"[Consolidator] Successfully synthesized {len(results)}/{len(tasks)} facts")
@@ -800,179 +859,67 @@ class MemoryConsolidator:
             max_supported_by: Maximum number of SUPPORTED_BY edges to create (default: 5)
         """
         
-        # Generate Fact ID
-        fact_id = _make_fact_id(person_id, fact_data.get('object_id', concept_id), fact_data['predicate'],
-                                [event['id'] for event in supporting_events if event.get('id')])
-
-        # Check if Fact already exists
-        if fact_id in self.graph._g:
-            print(f"[Consolidator] Fact {fact_id} already exists, skipping")
+        # Validate identities and complete support before any model call/write.
+        import math
+        from ..storage.vector_store import validate_vectors
+        person = self.graph.get_node(person_id)
+        concept = self.graph.get_node(concept_id)
+        if not person or person.get('node_type') != 'person' or not concept or concept.get('node_type') != 'concept':
+            raise ValueError('Consolidation subject and concept must resolve to declared graph nodes')
+        if fact_data.get('object_id') not in (None, concept_id):
+            raise ValueError('Consolidation cannot redirect the task concept address')
+        if any(not isinstance(fact_data.get(field), str) or not fact_data[field].strip() for field in ['content', 'predicate']):
+            raise ValueError('Consolidation requires nonempty proposition and predicate')
+        confidence = fact_data.get('confidence', 0.7)
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError('Consolidation confidence must be finite and within [0,1]')
+        event_ids = list(dict.fromkeys(e.get('id') for e in supporting_events))
+        if not event_ids or any(not key or not self.graph.get_node(key) or self.graph.get_node(key).get('node_type') != 'event' for key in event_ids):
+            raise ValueError('Every consolidation support must be an existing event occurrence')
+        fact_id = _make_fact_id(person_id, concept_id, fact_data['predicate'], event_ids)
+        existing = self.graph.get_node(fact_id)
+        if existing:
+            support = {tail for _, tail, edge in self.graph._g.out_edges(fact_id, data=True) if edge.get('rel_type') == 'SUPPORTED_BY'}
+            if (existing.get('node_type') != 'fact' or existing.get('subject_id') != person_id
+                    or existing.get('object_id') != concept_id or support != set(event_ids)):
+                raise ValueError('Consolidated address collision with another projection')
             return fact_id
-
-        # Normalize dates before creating Fact
-        valid_from = self._normalize_fact_date(fact_data.get('valid_from'))
-        valid_to = self._normalize_fact_date(fact_data.get('valid_to'))
-
-        # Importance score for retrieval: support count, confidence, recency
-        n_support = min(len(supporting_events), 10)
-        conf = fact_data.get('confidence', 0.7)
-        recency = 1.0  # Consolidated facts are from recent events
-        importance_score = min(1.0, 0.4 * (n_support / 5.0) + 0.4 * conf + 0.2 * recency)
-
-        # Create Fact node (consolidation produces stable facts)
-        fact = Fact(
-            id=fact_id,
-            content=fact_data['content'],
-            predicate=fact_data['predicate'],
-            subject_id=person_id,
-            object_id=fact_data.get('object_id', concept_id),
-            valid_from=valid_from,
-            valid_to=valid_to,
-            confidence=fact_data.get('confidence', 0.7),
-            metadata=Metadata(
-                source="memory_consolidation",
-                created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ),
+        fact = Fact(id=fact_id, content=fact_data['content'], predicate=fact_data['predicate'],
+            subject_id=person_id, object_id=concept_id,
+            valid_from=self._normalize_fact_date(fact_data.get('valid_from')),
+            valid_to=self._normalize_fact_date(fact_data.get('valid_to')), confidence=confidence,
+            metadata=Metadata(source='memory_consolidation', created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
             memory_lifecycle=MemoryLifecycle.STABLE,
-            importance_score=importance_score,
-        )
-
-        # Add Fact to graph using GraphStore's add_node method
+            importance_score=min(1., .4*(min(len(event_ids),10)/5.)+.4*confidence+.2))
+        person_name = person.get('canonical_name', person_id)
+        concept_name = concept.get('name', concept_id)
+        readable = concept_name.replace('c_', '').replace('_', ' ') if concept_name.startswith('c_') else concept_name
+        text = f'{person_name} {fact.predicate} {readable}: {fact.content}'
+        sources = []
+        if self.evidence_store is not None:
+            for key in event_ids:
+                chunks = self.evidence_store.get_chunks(key, limit=None)
+                if not chunks:
+                    raise ValueError('A supporting event has no recoverable original source')
+                sources.extend(chunks)
+        embeddings = self.embedding_encoder.encode([text])
+        if len(embeddings) != 1:
+            raise ValueError('Consolidation embedding must return exactly one vector')
+        # The store validates finite values/dimension before graph mutation.
+        if hasattr(self.vector_store, '_dim'):
+            validate_vectors([fact_id], embeddings, self.vector_store._dim)
+        elif not embeddings[0] or not all(math.isfinite(x) for x in embeddings[0]):
+            raise ValueError('Invalid consolidation embedding')
+        if hasattr(self.vector_store, 'add_typed'):
+            self.vector_store.add_typed(node_id=fact_id, vector=embeddings[0], node_type=NodeTypeEnum.FACT.value)
+        else:
+            self.vector_store.add([fact_id], embeddings[0])
         self.graph.add_node(fact)
-
-        # Link Person --[HAS_ATTRIBUTE]--> Fact
-        person_fact_rel = Relation(
-            head_id=person_id,
-            tail_id=fact_id,
-            rel_type='HAS_ATTRIBUTE',
-            weight=fact.confidence or 0.7,
-            confidence=fact.confidence or 0.7
-        )
-        self.graph.add_relations([person_fact_rel])
-
-        # Link Fact --[SUPPORTED_BY]--> Events
-        # Limit to max_supported_by most important events
-        supported_by_relations = []
-        
-        # Score events by importance (time, confidence)
-        scored_events = []
-        for event in supporting_events:
-            event_id = event.get('id', '')
-            if not event_id:
-                continue
-            
-            # Score: time (newer = higher) + confidence
-            time_score = 0.0
-            time_start = event.get('time_start')
-            if time_start:
-                try:
-                    # Use global datetime import from top of file
-                    dt = datetime.fromisoformat(time_start.replace('Z', '+00:00'))
-                    time_score = dt.timestamp()
-                except:
-                    pass
-            
-            confidence = event.get('confidence', 0.5)
-            score = time_score + confidence * 1000
-            scored_events.append((score, event))
-        
-        # Sort by score (descending) and take top max_supported_by
-        scored_events.sort(key=lambda x: x[0], reverse=True)
-        top_events = scored_events  # Preserve every source link; read-time retrieval owns the budget.
-        
-        for _, event in top_events:
-            event_id = event.get('id', '')
-            if event_id:
-                supported_by_rel = Relation(
-                    head_id=fact_id,
-                    tail_id=event_id,
-                    rel_type='SUPPORTED_BY',
-                    weight=1.0,
-                    confidence=1.0
-                )
-                supported_by_relations.append(supported_by_rel)
-        
-        if supported_by_relations:
-            self.graph.add_relations(supported_by_relations)
-
-            # Optionally archive original events
-            if archive_events:
-                event_data = self.graph.get_node(event_id)
-                if event_data:
-                    event_data['is_archived'] = True
-                    # Update node in graph
-                    for key, value in event_data.items():
-                        if key != 'id':  # Don't overwrite the node ID
-                            self.graph._g.nodes[event_id][key] = value
-
-        # Vectorize the Fact (CRITICAL for retrieval!)
-        try:
-            # CRITICAL FIX: 优化 Fact 的向量化文本，包含更多语义信息
-            # 包含：content（核心内容）、predicate（关系类型）、object_id（概念名称）
-            # 添加 subject 信息以提高检索精度
-            person_data = self.graph.get_node(person_id)
-            person_name = person_data.get('canonical_name', person_id) if person_data else person_id
-            
-            # 获取 concept 名称
-            concept_data = self.graph.get_node(fact.object_id or concept_id)
-            concept_name = concept_data.get('name', fact.object_id or concept_id) if concept_data else (fact.object_id or concept_id)
-            concept_name_readable = concept_name.replace('c_', '').replace('_', ' ') if concept_name.startswith('c_') else concept_name
-            
-            # 构建更丰富的向量化文本
-            # 格式：person_name predicate concept_name: content
-            # 例如："Alice has_habit hiking: Alice regularly goes hiking in the mountains"
-            fact_text = f"{person_name} {fact.predicate} {concept_name_readable}: {fact.content}"
-            
-            # CRITICAL FIX: 检查 fact_text 是否为空
-            if not fact_text or not fact_text.strip():
-                print(f"[Consolidator] Warning: Empty fact_text for {fact_id}, skipping vectorization")
-                return fact_id
-            
-            # 调用 encode 并检查返回结果
-            embeddings = self.embedding_encoder.encode([fact_text])
-            
-            # CRITICAL FIX: 检查返回结果是否为空
-            if not embeddings or len(embeddings) == 0:
-                print(f"[Consolidator] Warning: encode() returned empty list for fact {fact_id}, skipping vectorization")
-                return fact_id
-            
-            fact_embedding = embeddings[0]
-            
-            # CRITICAL FIX: 检查 embedding 是否为空或无效
-            if not fact_embedding or len(fact_embedding) == 0:
-                print(f"[Consolidator] Warning: Empty embedding vector for fact {fact_id}, skipping vectorization")
-                return fact_id
-            
-            # Add to typed vector store
-            node_type = NodeTypeEnum.FACT.value  # "fact"
-            self.vector_store.add_typed(
-                node_id=fact_id,
-                vector=fact_embedding,
-                node_type=node_type
-            )
-        except IndexError as e:
-            print(f"[Consolidator] Warning: IndexError when vectorizing fact {fact_id}: {e}")
-            print(f"  fact_text: {fact_text[:100] if 'fact_text' in locals() else 'N/A'}")
-            print(f"  embeddings length: {len(embeddings) if 'embeddings' in locals() else 'N/A'}")
-        except Exception as e:
-            print(f"[Consolidator] Warning: Failed to vectorize fact {fact_id}: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # P0 FIX: Register Fact evidence from supporting events
-        # This fixes the 91.8% bad cases issue where Facts have no evidence
-        if self.evidence_store:
-            try:
-                for event in supporting_events:
-                    event_id = event.get('id', '')
-                    if event_id:
-                        # Get chunks from event and register for fact
-                        event_chunks = self.evidence_store.get_chunks(event_id, limit=None)
-                        for chunk in event_chunks:
-                            self.evidence_store.add_chunk_for_entity(fact_id, chunk)
-            except Exception as e:
-                # Don't fail if evidence registration fails
-                if self.config.runtime.max_concurrency == 1:
-                    print(f"[Consolidator] Warning: Failed to register evidence for fact {fact_id}: {e}")
-
+        self.graph.add_relations([Relation(head_id=person_id,tail_id=fact_id,rel_type='HAS_ATTRIBUTE',weight=confidence,confidence=confidence)] +
+            [Relation(head_id=fact_id,tail_id=key,rel_type='SUPPORTED_BY') for key in event_ids])
+        if self.evidence_store is not None:
+            for source in dict.fromkeys(sources):
+                self.evidence_store.add_chunk_for_entity(fact_id, source)
+        if archive_events:
+            for key in event_ids:self.graph._g.nodes[key]['is_archived'] = True
         return fact_id

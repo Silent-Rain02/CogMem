@@ -6,8 +6,31 @@ from typing import Dict, Iterable, List, Tuple
 import faiss  # type: ignore
 import numpy as np
 
+def validate_snapshot(index, addresses, dim, metric):
+    """Validate a complete derived projection before it can replace live state."""
+    expected_metric = faiss.METRIC_INNER_PRODUCT if metric == 'cosine' else faiss.METRIC_L2
+    if index.d != dim or index.metric_type != expected_metric:
+        raise ValueError('Index dimension or distance metric does not match configuration')
+    if index.ntotal != len(addresses) or len(set(addresses)) != len(addresses):
+        raise ValueError('Index vectors and unique addresses must align one-to-one')
+    if any(not isinstance(key, str) or not key for key in addresses):
+        raise ValueError('Index addresses must be nonempty strings')
+
+
+def validate_vectors(ids, vectors, dim):
+    arr = np.asarray(vectors, dtype=np.float32)
+    if len(ids) != len(vectors) or arr.shape != (len(ids), dim):
+        raise ValueError("Each ID requires one vector of the configured dimension")
+    if any(not isinstance(key, str) or not key for key in ids):
+        raise ValueError("Vector IDs must be nonempty strings")
+    if not np.isfinite(arr).all():
+        raise ValueError("Vectors must be finite")
+    return arr
+
 class VectorStore:
     def __init__(self, dim: int, metric: str = "cosine") -> None:
+        if metric not in {"cosine", "l2"}:
+            raise ValueError("Unsupported vector metric")
         self._dim = dim
         self._metric = metric
         if metric == "cosine":
@@ -21,14 +44,13 @@ class VectorStore:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
         return vectors / norms
 
+    def _validate_vectors(self, ids, vectors):
+        return validate_vectors(ids, vectors, self._dim)
+
     def add(self, ids: List[str], vectors: List[List[float]]) -> None:
         if not ids and not vectors:
             return
-        arr = np.asarray(vectors, dtype=np.float32)
-        if len(ids) != len(vectors) or arr.shape != (len(ids), self._dim):
-            raise ValueError("Each ID requires one vector of the configured dimension")
-        if not np.isfinite(arr).all():
-            raise ValueError("Vectors must be finite")
+        arr = self._validate_vectors(ids, vectors)
         if self._metric == "cosine":
             arr = self._normalize(arr)
         # An ID names one current derived projection, not multiple ANN entries.
@@ -74,7 +96,9 @@ class VectorStore:
                 f"Please rebuild the index with the current embedding model."
             )
         
-        q = np.asarray([query_vec], dtype=np.float32)
+        if top_k <= 0:
+            return []
+        q = self._validate_vectors(["query"], [query_vec])
         if self._metric == "cosine":
             q = self._normalize(q)
         D, I = self._index.search(q, top_k)
@@ -102,22 +126,18 @@ class VectorStore:
             ValueError: If loaded index dimension doesn't match VectorStore dimension.
             This is a critical error - the embedding model dimension must match the index dimension.
         """
-        if os.path.exists(index_path):
-            loaded_index = faiss.read_index(index_path)
-            loaded_dim = loaded_index.d
-            if loaded_dim != self._dim:
-                raise ValueError(
-                    f"CRITICAL: Index dimension mismatch!\n"
-                    f"  - Loaded index has {loaded_dim} dimensions\n"
-                    f"  - VectorStore expects {self._dim} dimensions (from embedding model)\n"
-                    f"  - This mismatch will cause search failures!\n"
-                    f"  - SOLUTION: Rebuild the index with the current embedding model, "
-                    f"or switch to the embedding model that built this index."
-                )
-            self._index = loaded_index
-        if os.path.exists(id_path):
-            with open(id_path, "rb") as f:
-                self._ids = list(np.load(f, allow_pickle=True))
+        present = (os.path.exists(index_path), os.path.exists(id_path))
+        if any(present) and not all(present):
+            raise ValueError('Incomplete vector snapshot: index and ID file are both required')
+        if not any(present):
+            empty = VectorStore(self._dim, self._metric)
+            self._index, self._ids = empty._index, []
+            return
+        loaded_index = faiss.read_index(index_path)
+        with open(id_path, "rb") as f:
+            loaded_ids = list(np.load(f, allow_pickle=True))
+        validate_snapshot(loaded_index, loaded_ids, self._dim, self._metric)
+        self._index, self._ids = loaded_index, loaded_ids
 
     def size(self) -> int:
         return len(self._ids)

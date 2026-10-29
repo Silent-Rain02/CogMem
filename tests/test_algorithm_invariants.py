@@ -230,6 +230,8 @@ def test_all_support_links_and_original_chunks_survive_synthesis():
     consolidator.embedding_encoder = SimpleNamespace(encode=lambda texts: [[1.0] for _ in texts])
     consolidator.vector_store = SimpleNamespace(add_typed=lambda **kwargs: None)
     consolidator.evidence_store = EvidenceStore()
+    consolidator.graph._g.add_node('p', node_type='person', canonical_name='Person')
+    consolidator.graph._g.add_node('c', node_type='concept', name='Concept')
     events = [{'id': f'event_{i}'} for i in range(8)]
     for item in events:
         consolidator.graph._g.add_node(item['id'], node_type='event')

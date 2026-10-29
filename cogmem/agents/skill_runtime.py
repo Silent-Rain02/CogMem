@@ -72,19 +72,13 @@ class SkillRuntime:
             r"\b(before|after|during|since|until|ago|recently|recent|latest|earliest)\b",
             r"\b(summer|spring|fall|winter|weekend)\b",
         ]
-        matches = []
-        for pattern in time_patterns:
-            for match in re.findall(pattern, query, re.IGNORECASE):
-                if isinstance(match, tuple):
-                    match = next((part for part in match if part), "")
-                if match:
-                    matches.append(str(match))
-        deduped = []
-        for item in matches:
-            lowered = item.lower()
-            if lowered not in deduped:
-                deduped.append(lowered)
-        return " ".join(deduped[:3]).strip()
+        matches = [match for pattern in time_patterns
+                   for match in re.finditer(pattern, query, re.IGNORECASE)]
+        if not matches:
+            return ""
+        # Preserve both qualifiers and their order. A bag of matched tokens
+        # could turn "before 2020" into "2020 before" or omit a second bound.
+        return query[min(m.start() for m in matches):max(m.end() for m in matches)].strip()
 
     def _build_routing_output(self, context: SkillContext) -> Dict[str, Any]:
         query = (context.query or "").lower()

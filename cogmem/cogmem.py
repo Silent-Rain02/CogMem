@@ -4,6 +4,7 @@
 """
 
 from __future__ import annotations
+from cogmem.models.execution_errors import raise_if_execution_failure
 
 import threading
 from copy import deepcopy
@@ -79,6 +80,7 @@ class CogMem:
                           f"Updating config to match actual dimension.")
                     self.cfg.model.embedding_dim = actual_dim
         except Exception as e:
+            raise_if_execution_failure(e)
             # 若探测失败，回退到配置中的 embedding_dim
             print(f"[CogMem] Warning: Failed to probe embedding dimension: {e}. "
                   f"Using config value: {self.cfg.model.embedding_dim}")
@@ -97,7 +99,8 @@ class CogMem:
                 loaded_index = faiss.read_index(ipath)
                 index_dim = loaded_index.d
                 print(f"[CogMem] Found existing index with {index_dim} dimensions")
-        except Exception:
+        except Exception as execution_error:
+            raise_if_execution_failure(execution_error)
             # 如果加载失败，忽略（可能是首次运行）
             pass
         
@@ -309,7 +312,8 @@ class CogMem:
                                 for neighbor in neighbors:
                                     if isinstance(neighbor, str):
                                         entities.add(neighbor)
-                            except Exception:
+                            except Exception as execution_error:
+                                raise_if_execution_failure(execution_error)
                                 pass
 
                 # 从observation中提取节点ID
@@ -334,11 +338,13 @@ class CogMem:
                         for match in node_matches:
                             if isinstance(match, str):
                                 entities.add(match)
-                    except Exception:
+                    except Exception as execution_error:
+                        raise_if_execution_failure(execution_error)
                         # 如果转换失败，跳过
                         pass
 
             except Exception as e:
+                raise_if_execution_failure(e)
                 # 如果处理某个步骤失败，记录错误但继续处理其他步骤
                 continue
 
@@ -434,7 +440,8 @@ class CogMem:
                                     # 尝试从文本中提取Turn ID格式（如"D2:8"）
                                     turn_id_matches = re.findall(r'\b(D\d+:\d+)\b', span_text)
                                     turn_ids_found.update(turn_id_matches)
-                        except Exception:
+                        except Exception as execution_error:
+                            raise_if_execution_failure(execution_error)
                             pass
                     
                     # 方法2: 从evidence_store的chunk文本中提取Turn ID
@@ -450,7 +457,8 @@ class CogMem:
                                         break
                                 if len(turn_ids_found) >= 3:
                                     break
-                            except Exception:
+                            except Exception as execution_error:
+                                raise_if_execution_failure(execution_error)
                                 pass
                     
                     # 构建证据字符串，如果找到 turn_id 则包含
@@ -533,7 +541,8 @@ class CogMem:
         try:
             import time
             c.metadata.updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        except Exception:
+        except Exception as execution_error:
+            raise_if_execution_failure(execution_error)
             pass
         self.graph.add_concepts([c])
     
@@ -548,66 +557,11 @@ class CogMem:
 
     # ==================== 持久化 ====================
     def save(self, base_dir: Optional[str] = None) -> None:
-        """保存索引到磁盘（线程安全）
-        
-        使用锁确保同时只有一个保存操作，避免文件写入冲突。
-        """
-        # 使用非阻塞锁：如果正在保存，跳过本次保存（避免阻塞索引过程）
-        if not self._save_lock.acquire(blocking=False):
-            print("[CogMem] 保存操作正在进行中，跳过本次保存请求")
-            return
-        
-        try:
-            base = base_dir or self.workspace_dir
-            gpath, ipath, eidspath = build_paths(
-                base, self.cfg.graph_file, self.cfg.faiss_index_file, self.cfg.entity_store_file
-            )
-            # 变更日志路径
-            import os
-            changelog_path = os.path.join(base, self.cfg.graph_changelog_file)
-            
-            print("[CogMem] 开始保存索引...")
-            print(f"  - 保存图结构...")
-            self.graph.save(gpath, changelog_path=changelog_path)
-            print(f"  - 保存向量索引...")
-            
-            # TypedVectorStore保存到目录
-            if isinstance(self.vstore, TypedVectorStore):
-                typed_index_dir = os.path.join(base, "typed_indices")
-                self.vstore.save(typed_index_dir)
-            else:
-                # 向后兼容：普通VectorStore保存到文件
-                self.vstore.save(ipath, eidspath)
-            
-            # 片段索引
-            if self.chunk_store:
-                print(f"  - 保存片段索引...")
-                self.chunk_store.save(
-                    os.path.join(base, self.cfg.chunk_index_file),
-                    os.path.join(base, self.cfg.chunk_meta_file),
-                )
-            
-            # EvidenceStore（已处理的文档ID）
-            print(f"  - 保存证据存储...")
-            evidence_store_path = os.path.join(base, self.cfg.evidence_store_file)
-            self.indexer.evidence.save(evidence_store_path)
-            
-            # 导出知识图谱为JSON格式（便于手工检查）
-            try:
-                graph_json_path = os.path.join(base, "knowledge_graph.json")
-                self.graph.export_json(graph_json_path, indent=2)
-                print(f"  - 导出知识图谱JSON: {graph_json_path}")
-            except Exception as e:
-                print(f"  [WARN] 导出知识图谱JSON失败（不影响主流程）: {e}")
-            
-            print("[CogMem] [OK] 索引保存完成")
-        except Exception as e:
-            print(f"[CogMem] [ERROR] 保存失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise
-        finally:
-            self._save_lock.release()
+        """Wait for other saves, then publish one complete recoverable generation."""
+        from .storage.workspace import WorkspaceView, save_workspace
+        with self._save_lock:
+            view = WorkspaceView(self.graph, self.vstore, self.chunk_store, self.indexer.evidence)
+            save_workspace(self.cfg, base_dir or self.workspace_dir, view)
 
     def load(self, base_dir: Optional[str] = None) -> None:
         """从磁盘加载索引
@@ -615,72 +569,50 @@ class CogMem:
         Args:
             base_dir: 索引目录，如果为None则使用workspace_dir
         """
-        base = base_dir or self.workspace_dir
-        gpath, ipath, eidspath = build_paths(
-            base, self.cfg.graph_file, self.cfg.faiss_index_file, self.cfg.entity_store_file
-        )
-        # 变更日志路径
-        import os
-        changelog_path = os.path.join(base, self.cfg.graph_changelog_file)
-        self.graph.load(gpath, changelog_path=changelog_path)
-        
-        # TypedVectorStore从目录加载
-        try:
-            if isinstance(self.vstore, TypedVectorStore):
-                typed_index_dir = os.path.join(base, "typed_indices")
-                if os.path.exists(typed_index_dir):
-                    self.vstore.load(typed_index_dir)
-                else:
-                    print(f"[CogMem] Warning: Typed indices directory not found: {typed_index_dir}")
-                    print(f"[CogMem] Index will be empty. You may need to rebuild it.")
-            else:
-                # 向后兼容：普通VectorStore从文件加载
-                self.vstore.load(ipath, eidspath)
-        except ValueError as e:
-            # 维度不匹配错误
-            print(f"[CogMem] [ERROR] Failed to load index: {e}")
-            print(f"[CogMem] The index dimension doesn't match the current embedding model.")
-            print(f"[CogMem] Please rebuild the index or switch to the correct embedding model.")
-            raise
-        # 片段索引
-        if self.chunk_store:
-            self.chunk_store.load(
-                os.path.join(base, self.cfg.chunk_index_file),
-                os.path.join(base, self.cfg.chunk_meta_file),
-            )
-        # EvidenceStore（已处理的文档ID）
-        evidence_store_path = os.path.join(base, self.cfg.evidence_store_file)
-        self.indexer.evidence.load(evidence_store_path)
+        from .storage.workspace import read_workspace
+        view = read_workspace(self.cfg, base_dir or self.workspace_dir)
+        self._install_workspace(view)
+
+    def _install_workspace(self, view):
+        """Bind only a validated, complete in-memory workspace view."""
+        # Prepare the query stack too, so even initialization failure cannot
+        # partially rebind the live workspace. No model request is needed.
+        from types import SimpleNamespace
+        proxy = SimpleNamespace(cfg=self.cfg, graph=view.graph, vstore=view.vectors,
+            chunk_store=view.chunks, _embed=self._embed, llm=self.llm,
+            indexer=SimpleNamespace(evidence=view.evidence))
+        coordinator = QAOrchestrator(proxy)
+        coordinator.cogmem = self
+        self.graph, self.vstore, self.chunk_store = view.graph, view.vectors, view.chunks
+        self.indexer._graph = self.graph
+        self.indexer._typed_vstore = self.vstore if isinstance(self.vstore, TypedVectorStore) else None
+        self.indexer._vstore = self.vstore if isinstance(self.vstore, VectorStore) else None
+        self.indexer._chunk_store = self.chunk_store
+        self.indexer._evidence = view.evidence
+        self.qa_orchestrator = coordinator
 
     def is_indexed(self) -> bool:
-        """检查工作空间是否存在完整索引"""
-        import os
-        base = self.workspace_dir
-        gpath, ipath, eidspath = build_paths(
-            base, self.cfg.graph_file, self.cfg.faiss_index_file, self.cfg.entity_store_file
-        )
-        
-        # 检查图结构文件
-        if not os.path.exists(gpath):
+        """Validate source/index closure; corrupt snapshots are errors, not misses."""
+        from pathlib import Path
+        from .storage.workspace import read_workspace
+        root = Path(self.workspace_dir)
+        if not root.exists() or not any(root.iterdir()):
             return False
-            
-        # 检查向量索引（兼容旧版单文件和新版分片目录）
-        typed_index_dir = os.path.join(base, "typed_indices")
-        if os.path.exists(typed_index_dir):
-            # 如果是分片目录，至少要存在目录
-            return True
-        
-        # 否则检查旧版文件
-        return os.path.exists(ipath) and os.path.exists(eidspath)
+        view = read_workspace(self.cfg, root)
+        return view.graph.num_entities() > 0
 
     def add_documents_incremental(self, docs: Iterable[Doc], force_rebuild: bool = False) -> List[Concept]:
-        """增量索引：若已有索引且force_rebuild=False，只处理新文档；否则全量重建
+        """增量索引：读取完整的已有工作空间，只处理新文档。
+
+        全量重建必须使用新的 workspace，避免覆盖不可变原文。
         
         Args:
             docs: Documents to add
-            force_rebuild: Whether to force a full rebuild
+            force_rebuild: Unsupported in place; use a new workspace for a rebuild
         """
-        if not force_rebuild and self.is_indexed():
+        if force_rebuild:
+            raise ValueError('In-place force_rebuild is unsafe for immutable sources. Build in a new workspace and replace explicitly after validation.')
+        if self.is_indexed():
             # 加载已有索引
             self.load()
             # 获取已有实体ID集合，用于去重
@@ -706,7 +638,8 @@ class CogMem:
         concept_high_threshold: float = 0.95,
         fact_high_threshold: float = 0.95,
         max_supported_by_per_fact: int = 5,
-        cleanup_archived: bool = True
+        cleanup_archived: bool = True,
+        max_time_window_days: int = 30
     ) -> Dict:
         """Run memory consolidation to convert episodic memories (Events) into semantic memories (Facts)
         
@@ -722,8 +655,9 @@ class CogMem:
             concept_similarity_threshold: Threshold for concept similarity (default: 0.90)
             concept_high_threshold: High similarity threshold for full concept merge (default: 0.95)
             fact_high_threshold: High similarity threshold for full fact merge (default: 0.95)
-            max_supported_by_per_fact: Maximum SUPPORTED_BY edges per fact (default: 5)
-            cleanup_archived: Whether to delete archived nodes after consolidation (default: True)
+            max_supported_by_per_fact: Deprecated; complete provenance is retained, limits apply at read time
+            cleanup_archived: Remove archived vector projections while retaining graph/source history
+            max_time_window_days: Maximum occurrence-time span of a synthesis group; unknown times are excluded
         
         Returns:
             Statistics dictionary with consolidation results
@@ -735,15 +669,18 @@ class CogMem:
             >>> print(f"Created {stats['facts_created']} facts from {stats['events_clustered']} events")
         """
         from .memory.consolidator import MemoryConsolidator
-        
+        from .storage.workspace import WorkspaceView, validate_workspace
+        previous = WorkspaceView(self.graph, self.vstore, self.chunk_store, self.indexer.evidence)
+        staged = deepcopy(previous)
         consolidator = MemoryConsolidator(
             config=self.cfg,
-            graph=self.graph,
-            vector_store=self.vstore,
+            graph=staged.graph,
+            vector_store=staged.vectors,
             embedding_encoder=self._embed,
-            evidence_store=self.indexer.evidence  # P0: Use indexer.evidence (single source of truth)
+            evidence_store=staged.evidence,
+            chunk_store=staged.chunks
         )
-        
+
         stats = consolidator.run_consolidation(
             source_workspace=None,  # Use current graph
             target_workspace=None,  # Modify in place
@@ -756,10 +693,19 @@ class CogMem:
             concept_high_threshold=concept_high_threshold,
             fact_high_threshold=fact_high_threshold,
             max_supported_by_per_fact=max_supported_by_per_fact,
-            cleanup_archived=cleanup_archived
+            cleanup_archived=cleanup_archived,
+            max_time_window_days=max_time_window_days
         )
         
-        # Save the updated graph
-        self.save()
-        
+        if stats.get('errors') or stats.get('synthesis_failed'):
+            stats['committed'] = False
+            return stats
+        validate_workspace(self.cfg, staged)
+        self._install_workspace(staged)
+        try:
+            self.save()
+        except BaseException:
+            self._install_workspace(previous)
+            raise
+        stats['committed'] = True
         return stats

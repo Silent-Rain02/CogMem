@@ -17,7 +17,7 @@ import os
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
-from .vector_store import VectorStore
+from .vector_store import VectorStore, validate_vectors
 
 class TypedVectorStore:
     """按节点类型分片的向量存储，支持高效的类型化检索
@@ -84,65 +84,32 @@ class TypedVectorStore:
             vector: 向量表示
             node_type: 节点类型（如 "event", "fact", "person"）
         """
-        # CRITICAL FIX: 添加类型不匹配警告，防止向量静默丢失
-        if node_type not in self._stores:
-            print(f"[TypedVectorStore] WARNING: Unsupported node_type '{node_type}' for {node_id}, vector will be dropped!")
-            print(f"[TypedVectorStore] Supported types: {self._supported_types}")
-            return
-        
-        # 添加到类型索引
-        self._stores[node_type].add([node_id], [vector])
-        self._type_counts[node_type] = self._stores[node_type].size()
-        
-        # 条件添加到全局索引
-        if self._enable_global_index and self._global_store:
-            self._global_store.add([node_id], [vector])
-    
-    def add_batch_typed(
-        self, 
-        node_ids: List[str], 
-        vectors: List[List[float]], 
-        node_types: List[str]
-    ) -> None:
-        """批量添加向量（类型化）
-        
-        Args:
-            node_ids: 节点ID列表
-            vectors: 向量列表
-            node_types: 节点类型列表
-        """
+        self.add_batch_typed([node_id], [vector], [node_type])
+
+    def add_batch_typed(self, node_ids, vectors, node_types) -> None:
+        """Validate the whole batch before mutating any typed/global projection."""
         if not (len(node_ids) == len(vectors) == len(node_types)):
-            raise ValueError("node_ids, vectors, node_types 长度必须一致")
-        
-        # 按类型分组
-        type_groups: Dict[str, Tuple[List[str], List[List[float]]]] = defaultdict(
-            lambda: ([], [])
-        )
-        
-        # CRITICAL FIX: 添加类型不匹配警告，防止向量静默丢失
-        dropped_count = 0
-        for node_id, vector, node_type in zip(node_ids, vectors, node_types):
-            if node_type in self._stores:
-                ids_list, vecs_list = type_groups[node_type]
-                ids_list.append(node_id)
-                vecs_list.append(vector)
-            else:
-                dropped_count += 1
-        
-        if dropped_count > 0:
-            print(f"[TypedVectorStore] WARNING: {dropped_count} vectors dropped due to unsupported node_type(s)")
-            print(f"[TypedVectorStore] Supported types: {self._supported_types}")
-        
-        # 批量添加到各类型索引
-        for node_type, (ids, vecs) in type_groups.items():
-            if ids:
-                self._stores[node_type].add(ids, vecs)
-                self._type_counts[node_type] = self._stores[node_type].size()
-        
-        # 条件批量添加到全局索引
-        if self._enable_global_index and self._global_store:
+            raise ValueError('IDs, vectors and node types must align')
+        if not node_ids:
+            return
+        validate_vectors(node_ids, vectors, self._dim)
+        if any(kind not in self._stores for kind in node_types):
+            raise ValueError('Unsupported vector node type')
+        known = {node: kind for kind, store in self._stores.items() for node in store._ids}
+        for node, kind in zip(node_ids, node_types):
+            if node in known and known[node] != kind:
+                raise ValueError('A vector address cannot belong to multiple node types')
+            known[node] = kind
+        groups = defaultdict(lambda: ([], []))
+        for node, vector, kind in zip(node_ids, vectors, node_types):
+            groups[kind][0].append(node)
+            groups[kind][1].append(vector)
+        for kind, (ids, values) in groups.items():
+            self._stores[kind].add(ids, values)
+            self._type_counts[kind] = self._stores[kind].size()
+        if self._global_store is not None:
             self._global_store.add(node_ids, vectors)
-    
+
     def search_by_type(
         self, 
         query_vec: List[float], 
@@ -285,29 +252,38 @@ class TypedVectorStore:
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"Directory not found: {base_dir}")
         
-        # 加载统计信息
+        # Load into temporary stores; a corrupt later shard must not replace
+        # already-valid live state or retain data from another memory bank.
         stats_path = os.path.join(base_dir, "typed_store_stats.json")
         if os.path.exists(stats_path):
             import json
-            with open(stats_path, "r", encoding="utf-8") as f:
+            with open(stats_path, encoding='utf-8') as f:
                 stats = json.load(f)
-                self._type_counts = defaultdict(int, stats.get("type_counts", {}))
-        
-        # 加载全局索引（如果启用）
-        if self._enable_global_index and self._global_store:
-            global_index_path = os.path.join(base_dir, "global_index.faiss")
-            global_id_path = os.path.join(base_dir, "global_ids.npy")
-            if os.path.exists(global_index_path) and os.path.exists(global_id_path):
-                self._global_store.load(global_index_path, global_id_path)
-        
-        # 加载各类型索引
-        for node_type in self._supported_types:
-            type_index_path = os.path.join(base_dir, f"{node_type.lower()}_index.faiss")
-            type_id_path = os.path.join(base_dir, f"{node_type.lower()}_ids.npy")
-            
-            if os.path.exists(type_index_path) and os.path.exists(type_id_path):
-                self._stores[node_type].load(type_index_path, type_id_path)
-    
+            if stats.get('dim', self._dim) != self._dim or stats.get('metric', self._metric) != self._metric:
+                raise ValueError('Typed snapshot configuration does not match dimension or metric')
+        stores = {kind: VectorStore(self._dim, self._metric) for kind in self._supported_types}
+        seen = set()
+        for kind, store in stores.items():
+            store.load(os.path.join(base_dir, f'{kind}_index.faiss'), os.path.join(base_dir, f'{kind}_ids.npy'))
+            if seen.intersection(store._ids):
+                raise ValueError('Snapshot contains an address in multiple type shards')
+            seen.update(store._ids)
+        global_store = None
+        if self._enable_global_index:
+            global_store = VectorStore(self._dim, self._metric)
+            paths = [os.path.join(base_dir, name) for name in ['global_index.faiss', 'global_ids.npy']]
+            if any(os.path.exists(path) for path in paths):
+                global_store.load(*paths)
+                if set(global_store._ids) != seen:
+                    raise ValueError('Global and typed snapshot addresses do not match')
+            else:
+                for store in stores.values():
+                    if store.size():
+                        global_store.add(store._ids, store._index.reconstruct_n(0, store.size()).tolist())
+        self._stores = stores
+        self._global_store = global_store
+        self._type_counts = defaultdict(int, {kind: store.size() for kind, store in stores.items()})
+
     def clear(self) -> None:
         """清空所有索引"""
         # 重新初始化所有存储

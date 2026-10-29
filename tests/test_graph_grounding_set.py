@@ -68,3 +68,19 @@ def test_an_empty_retrieval_cannot_reuse_a_previous_hit_set():
     agent._tool_calls_used=0;agent._operator_budget=lambda:5;agent.skill_runtime=None
     assert agent._execute_tool('semantic_search',{})=='No results'
     assert agent._last_tool_node_hits['semantic_search']==[]
+
+
+
+def test_explicit_raw_chunk_anchor_resolves_without_global_search():
+    agent=instance()
+    output=agent._tool_get_evidence('cb',query='query',limit=1)
+    assert 'Original source B' in output and 'Original source A' not in output
+    assert 'Unrelated source X' not in output
+
+
+def test_partial_cached_sources_do_not_mask_complete_declared_support_set():
+    agent=instance();graph=agent.graph_service.graph_store._g
+    graph.add_edge('a','b',rel_type='SUPPORTED_BY')
+    output=agent._tool_get_evidence('a',limit=2)
+    assert 'Original source A' in output and 'Original source B' in output
+    assert output.count('[Evidence ')==2 and 'Unrelated source X' not in output

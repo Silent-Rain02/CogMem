@@ -45,7 +45,11 @@ class GraphStore:
 
     def add_relations(self, relations: Iterable[Relation]) -> None:
         for r in relations:
-            self._g.add_edge(r.head_id, r.tail_id, **r.model_dump())
+            payload = r.model_dump()
+            existing = self._g.get_edge_data(r.head_id, r.tail_id, default={})
+            if any(attrs == payload for attrs in existing.values()):
+                continue
+            self._g.add_edge(r.head_id, r.tail_id, **payload)
             self._changelog.append({
                 "op": "upsert_relation",
                 "head": r.head_id,
@@ -720,17 +724,23 @@ class GraphStore:
                 pickle.dump(self._changelog, f)
 
     def load(self, path: str, changelog_path: Optional[str] = None) -> None:
-        if not os.path.exists(path):
-            return
-        with open(path, "rb") as f:
-            self._g = pickle.load(f)
-        if changelog_path and os.path.exists(changelog_path):
-            with open(changelog_path, "rb") as f:
-                self._changelog = pickle.load(f)
-        
-        # Rebuild indexes after loading
-        self._index_dirty = True
-        self._rebuild_indexes()
+        candidate = GraphStore()
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                graph = pickle.load(f)
+            if not isinstance(graph, nx.MultiDiGraph):
+                raise ValueError('Invalid graph snapshot')
+            candidate._g = graph
+            if changelog_path and os.path.exists(changelog_path):
+                with open(changelog_path, "rb") as f:
+                    log = pickle.load(f)
+                if not isinstance(log, list):
+                    raise ValueError('Invalid graph changelog')
+                candidate._changelog = log
+        elif changelog_path and os.path.exists(changelog_path):
+            raise ValueError('Graph changelog cannot be loaded without its graph')
+        candidate._rebuild_indexes()
+        self.__dict__.update(candidate.__dict__)
 
     def num_entities(self) -> int:
         return self._g.number_of_nodes()

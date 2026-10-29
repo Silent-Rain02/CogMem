@@ -3,15 +3,23 @@
 This module provides a clean interface for graph operations without LLM involvement.
 It serves as the foundation for the SearchAgent's reasoning capabilities.
 """
+from cogmem.models.execution_errors import raise_if_execution_failure
 
 from typing import List, Dict, Tuple, Optional, Set, Any
 from dataclasses import dataclass
+from collections import deque
+import re
 
 from .graph_store import GraphStore
 from .vector_store import VectorStore
 from ..models.embedding import EmbeddingEncoder
 from .schema import NodeTypeEnum
 from ..utils.bm25_retriever import BM25Retriever, BM25_AVAILABLE
+
+
+def _contains_identity_phrase(phrase: str, text: str) -> bool:
+    """Match complete name tokens, including punctuation and possessives."""
+    return bool(phrase and re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text))
 
 @dataclass
 class AnchorResult:
@@ -103,7 +111,7 @@ class GraphService:
                 node_data = self.graph_store.get_node(person_id_candidate)
                 if node_data and node_data.get('is_archived'):
                     continue
-                is_person = (node_data and node_data.get('node_type') == 'person') or person_id_candidate.startswith('p_')
+                is_person = node_data and node_data.get('node_type') == 'person'
                 if is_person and (not types or 'person' in types):
                         results_map[person_id_candidate] = AnchorResult(
                             node_id=person_id_candidate,
@@ -126,7 +134,7 @@ class GraphService:
                 node_data = self.graph_store.get_node(concept_id_candidate)
                 if node_data and node_data.get('is_archived'):
                     continue
-                is_concept = (node_data and node_data.get('node_type') == 'concept') or concept_id_candidate.startswith('c_')
+                is_concept = node_data and node_data.get('node_type') == 'concept'
                 if is_concept and (not types or 'concept' in types):
                         results_map[concept_id_candidate] = AnchorResult(
                             node_id=concept_id_candidate,
@@ -172,7 +180,8 @@ class GraphService:
                             metadata=node_data
                         )
                     # Substring Match (Boost Score 0.9)
-                    elif query_lower in canonical_name_lower or canonical_name_lower in query_lower:
+                    elif (_contains_identity_phrase(query_lower, canonical_name_lower) or
+                          _contains_identity_phrase(canonical_name_lower, query_lower)):
                         results_map[node_id] = AnchorResult(
                             node_id=node_id,
                             node_type=node_type,
@@ -180,19 +189,8 @@ class GraphService:
                             score=0.9,
                             metadata=node_data
                         )
-                    # ROOT FIX: Long Query Entity Extraction
-                    # If query is a sentence, check if this person's name appears in it
-                    elif is_long_query and canonical_name_lower in query_lower:
-                        # Higher score for name appearing in a sentence
-                        results_map[node_id] = AnchorResult(
-                            node_id=node_id,
-                            node_type=node_type,
-                            name=canonical_name,
-                            score=0.95,
-                            metadata=node_data
-                        )
                     # ROOT FIX: Even if name doesn't match, check if ID exists in long query (e.g. "p_maria")
-                    elif is_long_query and node_id in query_lower:
+                    elif is_long_query and _contains_identity_phrase(node_id, query_lower):
                         results_map[node_id] = AnchorResult(
                             node_id=node_id,
                             node_type=node_type,
@@ -210,7 +208,8 @@ class GraphService:
                         alias_lower = alias.lower().strip()
                         if alias_lower == query_lower:
                             alias_score = 1.0
-                        elif query_lower in alias_lower or alias_lower in query_lower:
+                        elif (_contains_identity_phrase(query_lower, alias_lower) or
+                              _contains_identity_phrase(alias_lower, query_lower)):
                             alias_score = 0.85
                         else:
                             continue
@@ -318,6 +317,7 @@ class GraphService:
                         if len(results_map) >= top_k:
                             break
                 except Exception as e:
+                    raise_if_execution_failure(e)
                     # 如果 BM25 搜索失败，记录日志但不中断主流程
                     import logging
                     logger = logging.getLogger(__name__)
@@ -386,6 +386,7 @@ class GraphService:
                         metadata=node_data
                     )
             except Exception as e:
+                raise_if_execution_failure(e)
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.warning(f"Vector search failed in find_anchors: {e}")
@@ -393,7 +394,7 @@ class GraphService:
         # ===== Stage 4: Raw Chunk Search (Fallback for HotpotQA) =====
         # P0 FIX: Use ChunkStore.search() instead of TypedVectorStore.search_by_type('chunk')
         # (TypedVectorStore does not support 'chunk' type; chunks live in ChunkStore.)
-        if len(results_map) < top_k or all(r.score < 0.8 for r in results_map.values()):
+        if (not types or 'chunk' in types) and (len(results_map) < top_k or all(r.score < 0.8 for r in results_map.values())):
             try:
                 if query_embedding is None:
                     query_embeddings = self.embedding_encoder.encode([query])
@@ -413,7 +414,8 @@ class GraphService:
                             score=float(score) * 0.95,
                             metadata=node_data
                         )
-            except Exception:
+            except Exception as execution_error:
+                raise_if_execution_failure(execution_error)
                 pass
 
         # ===== Sort and Return =====
@@ -472,7 +474,8 @@ class GraphService:
                         result.metadata["known_facts"] = " | ".join(facts)
                     if recent_previews:
                         result.metadata["event_previews"] = " | ".join(recent_previews)
-                except Exception:
+                except Exception as execution_error:
+                    raise_if_execution_failure(execution_error)
                     pass
 
         return final_results
@@ -566,6 +569,7 @@ class GraphService:
             self._bm25_initialized = True
             
         except Exception as e:
+            raise_if_execution_failure(e)
             # 如果构建失败，标记为已初始化但不可用
             self._bm25_retriever = None
             self._bm25_initialized = True
@@ -592,112 +596,49 @@ class GraphService:
             - "证据链" (evidence chain): Use ['SUPPORTED_BY'] to find events that support a generalized Fact (Memory Consolidation)
             - Keyword filtering: Use keyword_filter to find specific events (e.g., keyword_filter="job" to find job loss events)
         """
+        if direction not in {'in', 'out', 'both'}:
+            raise ValueError('Traversal direction must be in, out or both')
+        if max_depth <= 0:
+            return []
         results = []
-        # ROOT FIX: Use (node_id, depth) as visited key to allow same node at different depths
-        # This prevents cycles while allowing legitimate multi-hop paths
-        visited = set()  # Set of (node_id, depth) tuples
-
-        for start_id in start_node_ids:
-            if start_id not in self.graph_store._g:
+        graph = self.graph_store._g
+        for start_id in dict.fromkeys(start_node_ids):
+            start = self.graph_store.get_node(start_id)
+            if not start or start.get('is_archived'):
                 continue
-
-            # Use BFS for controlled depth traversal
-            queue = [(start_id, 0)]  # (node_id, depth)
-            visited.add((start_id, 0))
-
+            # Expansion state is per root and separate from returned edge records.
+            # BFS visits each neighbor at its shortest distance from this root.
+            queue = deque([(start_id, 0)])
+            scheduled = {start_id}
             while queue:
-                current_node_id, depth = queue.pop(0)
-
+                current, depth = queue.popleft()
                 if depth >= max_depth:
                     continue
-
-                # Get neighbors based on direction
-                neighbors_to_check = []
-                if direction in ("out", "both"):
-                    # Outgoing edges: current_node -> neighbor
-                    for neighbor_id in self.graph_store._g.successors(current_node_id):
-                        neighbors_to_check.append(("out", neighbor_id))
-                
-                if direction in ("in", "both"):
-                    # Incoming edges: neighbor -> current_node
-                    for neighbor_id in self.graph_store._g.predecessors(current_node_id):
-                        neighbors_to_check.append(("in", neighbor_id))
-
-                for edge_direction, neighbor_id in neighbors_to_check:
-                    # ROOT FIX: Check if (node_id, depth) has been visited
-                    # Allow same node at different depths, but prevent cycles at same depth
-                    visit_key = (neighbor_id, depth)
-                    if visit_key in visited:
+                edges = []
+                if direction in {'out', 'both'}:
+                    edges.extend((tail, attrs) for _, tail, attrs in graph.out_edges(current, data=True))
+                if direction in {'in', 'both'}:
+                    edges.extend((head, attrs) for head, _, attrs in graph.in_edges(current, data=True))
+                for neighbor, attrs in edges:
+                    relation = attrs.get('rel_type', 'related')
+                    if relation_types and relation not in relation_types:
                         continue
-
-                    # Get edge data based on direction
-                    if edge_direction == "out":
-                        edges = self.graph_store._g[current_node_id][neighbor_id]
-                        source_id = current_node_id
-                        target_id = neighbor_id
-                    else:  # "in"
-                        edges = self.graph_store._g[neighbor_id][current_node_id]
-                        source_id = neighbor_id
-                        target_id = current_node_id
-
-                    for edge_key, edge_data in edges.items():
-                        rel_type = edge_data.get('rel_type', 'related')
-
-                        # Filter by relation type if specified
-                        if relation_types and rel_type not in relation_types:
+                    data = self.graph_store.get_node(neighbor)
+                    if not data or data.get('is_archived'):
+                        continue
+                    if keyword_filter:
+                        haystack = ' '.join(str(value or '') for value in
+                            [data.get('content'), data.get('title'), attrs.get('edge_title')]).lower()
+                        if not any(token in haystack for token in keyword_filter.lower().split()):
                             continue
-
-                        # Get neighbor node data - 关键：使用 target_id 从 graph_store 获取完整节点
-                        neighbor_data = self.graph_store.get_node(target_id)
-                        if not neighbor_data:
-                            # 如果 get_node 返回 None，尝试直接从图数据获取
-                            if target_id in self.graph_store._g:
-                                raw_data = dict(self.graph_store._g.nodes[target_id])
-                                raw_data['id'] = target_id  # 确保有 id 字段
-                                neighbor_data = raw_data
-                            else:
-                                # 如果节点不存在，至少返回 ID（不要返回 None）
-                                neighbor_data = {'id': target_id, 'node_type': 'unknown'}
-                        else:
-                            # 确保 neighbor_data 有 id 字段（get_node 可能不包含 id）
-                            if 'id' not in neighbor_data:
-                                neighbor_data['id'] = target_id
-
-                        # ENHANCED: Apply keyword filter if provided (Token-based OR matching)
-                        if keyword_filter:
-                            # Split filter into tokens (e.g., "job loss" -> ["job", "loss"])
-                            tokens = keyword_filter.lower().split()
-
-                            # Get content and title from neighbor node
-                            content_lower = (neighbor_data.get('content', '') or '').lower()
-                            title_lower = (neighbor_data.get('title', '') or '').lower()
-
-                            # ENHANCED: Also check edge properties
-                            edge_title_lower = (edge_data.get('edge_title', '') or '').lower()
-
-                            # Check if ANY token exists in content, title, or edge title
-                            match = any(t in content_lower for t in tokens) or \
-                                    any(t in title_lower for t in tokens) or \
-                                    any(t in edge_title_lower for t in tokens)
-
-                            if not match:
-                                continue
-
-                        results.append(TraversalResult(
-                            source_id=source_id,
-                            target_id=target_id,
-                            relation_type=rel_type,
-                            target_node=neighbor_data,
-                            weight=edge_data.get('weight', 1.0),
-                            confidence=edge_data.get('confidence', 1.0)
-                        ))
-
-                        # Add to queue for deeper traversal if needed
-                        # ROOT FIX: Mark as visited at current depth before adding to queue
-                        visited.add(visit_key)
-                        if depth + 1 < max_depth:
-                            queue.append((target_id, depth + 1))
-
+                    # target_id and target_node always identify the same visited
+                    # neighbor, including when following an incoming physical edge.
+                    results.append(TraversalResult(source_id=current, target_id=neighbor,
+                        relation_type=relation, target_node=data,
+                        weight=attrs.get('weight', 1.), confidence=attrs.get('confidence', 1.)))
+                    if neighbor not in scheduled and depth + 1 < max_depth:
+                        scheduled.add(neighbor)
+                        queue.append((neighbor, depth + 1))
         return results
 
     def find_common_ground(self, entity_ids: List[str], node_types: Optional[List[str]] = None, max_depth: int = 2) -> CommonGroundResult:
@@ -922,13 +863,19 @@ class GraphService:
             List of claim nodes with full context
         """
         claims = []
+        seen = set()
 
         # Find CLAIMS edges
         for edge in self.graph_store.get_edges_by_type('CLAIMS'):
             claim_id = edge['tail_id']
             claim_node = self.graph_store.get_node(claim_id)
 
-            if not claim_node or claim_node.get('node_type') != 'claim':
+            if (not claim_node or claim_node.get('node_type') != 'claim'
+                    or claim_node.get('is_archived') or claim_id in seen):
+                continue
+            # Attribution is part of the proposition, not a replaceable hint.
+            # A mismatched speaker edge cannot authorize a different speaker.
+            if claim_node.get('source_id') != edge['head_id']:
                 continue
 
             # Filter by source if specified
@@ -943,6 +890,7 @@ class GraphService:
             if sentiment and claim_node.get('sentiment') != sentiment:
                 continue
 
+            seen.add(claim_id)
             claims.append(claim_node)
 
         return claims
